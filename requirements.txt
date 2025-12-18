@@ -1,0 +1,81 @@
+langgraph
+dotenv
+langchain_core
+langchain
+langchain_openai
+langchain_community
+langchain-anthropic
+tavily-python
+langgraph-checkpoint-sqlite
+pypdf
+torch --index-url https://download.pytorch.org/whl/cu126
+torchvision --index-url https://download.pytorch.org/whl/cu126
+torchaudio --index-url https://download.pytorch.org/whl/cu126
+langchain-chroma
+langchain
+langchain-openai
+langchain-core
+langchain_community
+docx2txt
+pypdf
+python-multipart
+fastapi
+uvicorn
+langchain-ollama
+langchain
+langchain-huggingface
+sentence_transformers
+einops
+datasets
+langchain-graph-retriever
+langchain-graph-retriever[chroma]
+langchain_chroma
+sentence-transformers
+
+
+# Добавляем дополнительный индекс для пакетов PyTorch
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch
+torchvision
+torchaudio
+
+# LangChain и расширения
+langchain
+langchain-chroma
+langchain-core
+langchain-community
+langchain-openai
+langchain-ollama
+langchain-huggingface
+
+langchain-graph-retriever[chroma]
+
+# LangGraph и связанные
+langgraph
+langgraph-cli[inmem]
+langgraph-checkpoint-sqlite
+langgraph-supervisor
+
+# Остальные зависимости
+docx2txt
+pypdf
+python-multipart
+fastapi
+uvicorn
+sentence-transformers
+einops
+datasets
+tavily-python
+duckduckgo-search
+requests
+beautifulsoup4
+google-api-python-client
+gradio
+python-dotenv
+docx
+firecrawl-py
+pydantic>=2
+tiktoken>=0.7
+langchain_qdrant
+hf_xet

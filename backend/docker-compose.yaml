@@ -1,0 +1,52 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.15
+    container_name: qdrant-agents
+    volumes:
+      - ./backend/vectorstore/qdrant_data:/qdrant/storage:z
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    restart: unless-stopped
+    networks: [llmnet]
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    # если твоя версия compose умеет — раскомментируй; иначе можно опустить
+    command: >
+      --model Qwen/Qwen3-Embedding-0.6B
+      --dtype auto
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization 0.60
+      --download-dir /models
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - VLLM_LOGGING_LEVEL=INFO
+      # ключевое: дать приоритет WSL CUDA-библиотекам
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+    ports:
+      - "8000:8000"
+
+    runtime: nvidia
+
+    volumes:
+      - ./models:/models
+      - ./hf-cache:/root/.cache/huggingface
+      - ./triton-cache:/root/.triton
+      - ./torch-cache:/root/.cache/torch
+      # ключевые монтирования для WSL GPU
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  qdrant_data: {}
+
+networks:
+  llmnet:
+    driver: bridge
