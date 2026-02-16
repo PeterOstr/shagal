@@ -39,6 +39,7 @@ summaries/*
 internal_tech_files/
 data/
 out/
+artifacts/
 weather.csv
 
 # Модели

@@ -1,6 +1,8 @@
 # app/main.py
 
-from __future__ import annotations
+from app.core.logging_config import setup_logging
+setup_logging()
+
 
 from pathlib import Path
 from fastapi import FastAPI, BackgroundTasks, HTTPException
@@ -89,3 +91,30 @@ def get_run(run_id: str):
 @app.get("/runs")
 def list_runs():
     return run_repo.list_runs()
+
+
+@app.get("/health")
+def health():
+    status = {
+        "status": "ok",
+        "services": {}
+    }
+
+    # Проверка ClickHouse
+    try:
+        clickhouse_repo.fetch_emails(limit=1, offset=0)
+        status["services"]["clickhouse"] = "ok"
+    except Exception as e:
+        status["services"]["clickhouse"] = "error"
+        status["status"] = "degraded"
+
+    # Проверка Qdrant
+    try:
+        vector_repo.client.get_collections()
+        status["services"]["qdrant"] = "ok"
+    except Exception:
+        status["services"]["qdrant"] = "error"
+        status["status"] = "degraded"
+
+    return status
+

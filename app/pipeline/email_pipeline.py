@@ -6,14 +6,15 @@ from pathlib import Path
 
 from app.agents.batch_agent import BatchAgentFactory
 from app.agents.global_agent import GlobalAgentFactory
+import math
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class EmailSummaryPipeline:
     """
-    Pipeline не знает про FastAPI.
-    Pipeline знает только как:
-      - запустить batch агента
-      - запустить global агента
+
     """
 
     def __init__(
@@ -38,19 +39,49 @@ class EmailSummaryPipeline:
             model=global_model,
         ).create()
 
-    def run_batch_processing(self, project_hint: str):
-        return self.batch_agent.invoke({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        f"Начни обработку проекта {project_hint} батчами. "
-                        f"Делай summary каждого батча и сохраняй через save_summary. "
-                        f"Итоговый отчёт НЕ делай."
-                    )
-                }
-            ]
-        })
+    def run_batch_processing(self, project_hint: str, batch_size: int = 50):
+
+        offset = 0
+        batch_id = 1
+
+        # получаем примерный объём через similarity search
+        docs = self.vector_repo.similarity_search(project_hint, k=500)
+
+        total_docs = len(docs)
+        total_batches = math.ceil(total_docs / batch_size)
+
+        logger.info(
+            f"[BATCH] project={project_hint} "
+            f"total_docs={total_docs} "
+            f"batch_size={batch_size} "
+            f"total_batches={total_batches}"
+        )
+
+        while True:
+
+            batch_docs = docs[offset: offset + batch_size]
+
+            if not batch_docs:
+                break
+
+            logger.info(
+                f"[BATCH] Processing batch {batch_id}/{total_batches}"
+            )
+
+            # --- генерируем summary ---
+            summary = self._summarize_batch(batch_docs)
+
+            # --- сохраняем ---
+            output_file = self.artifact_dir / f"summary_batch_{batch_id}.txt"
+            output_file.write_text(summary, encoding="utf-8")
+
+            offset += batch_size
+            batch_id += 1
+
+        logger.info(
+            f"[BATCH] Completed all batches. total_batches={total_batches}"
+        )
+
 
     def run_global_summary(self, project_hint: str):
         return self.global_agent.invoke({
