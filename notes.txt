@@ -1,0 +1,10 @@
+User → /report/orchestrate → OrchestratorAgent
+        ↓
+OrchestratorAgent decides:
+    - batch
+    - final
+    - full
+        ↓
+ReportService executes deterministic workflow
+        ↓
+Artifacts written
