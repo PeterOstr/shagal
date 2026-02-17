@@ -10,6 +10,29 @@ import pandas as pd
 
 from app.pipeline.email_pipeline import EmailSummaryPipeline
 
+def extract_content(result) -> str:
+    """
+    Универсальный извлекатель текста из ответа LLM.
+    Защищает от разных форматов (dict, pydantic, ChatCompletion).
+    """
+
+    if result is None:
+        return ""
+
+    # LangChain message format
+    if hasattr(result, "messages"):
+        return result.messages[-1].content
+
+    # dict format
+    if isinstance(result, dict) and "messages" in result:
+        return result["messages"][-1].content
+
+    # OpenAI / DeepSeek ChatCompletion
+    if hasattr(result, "choices"):
+        return result.choices[0].message.content
+
+    return ""
+
 
 logger = logging.getLogger(__name__)
 
@@ -159,9 +182,7 @@ class ReportService:
 
             result = pipeline.run_global_summary(project_hint)
 
-            report_text = ""
-            if result and result.get("messages"):
-                report_text = result["messages"][-1].content
+            report_text = extract_content(result)
 
             (artifact_dir / "final_report.txt").write_text(
                 report_text,
@@ -225,9 +246,7 @@ class ReportService:
 
         result = pipeline.run_global_summary(project_hint)
 
-        report_text = ""
-        if result and result.get("messages"):
-            report_text = result["messages"][-1].content
+        report_text = extract_content(result)
 
         (artifact_dir / "final_report.txt").write_text(
             report_text,

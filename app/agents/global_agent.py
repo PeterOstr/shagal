@@ -55,21 +55,21 @@ class GlobalAgentFactory:
                 tools["search_emails_raw"],
             ],
             system_prompt=GLOBAL_SYSTEM_PROMPT,
-            middleware=[
-                PIIMiddleware("email", strategy="redact", apply_to_input=True),
-                PIIMiddleware(
-                    "phone_number",
-                    detector=(
-                        r"(?:\+?\d{1,3}[\s.-]?)?"
-                        r"(?:\(?\d{2,4}\)?[\s.-]?)?"
-                        r"\d{3,4}[\s.-]?\d{4}"
-                    ),
-                    strategy="redact",
-                ),
-                SummarizationMiddleware(
-                    model="gpt-5",
-                    max_tokens_before_summary=1000,
-                ),
-            ],
+            # middleware=[
+            #     PIIMiddleware("email", strategy="redact", apply_to_input=True),
+            #     PIIMiddleware(
+            #         "phone_number",
+            #         detector=(
+            #             r"(?:\+?\d{1,3}[\s.-]?)?"
+            #             r"(?:\(?\d{2,4}\)?[\s.-]?)?"
+            #             r"\d{3,4}[\s.-]?\d{4}"
+            #         ),
+            #         strategy="redact",
+            #     ),
+            #     SummarizationMiddleware(
+            #         model="gpt-5",
+            #         max_tokens_before_summary=1000,
+            #     ),
+            # ],
         )
         return agent

@@ -6,10 +6,15 @@ import logging
 from typing import List
 
 from openai import OpenAI
+import os
 
 logger = logging.getLogger(__name__)
 
-client = OpenAI()
+
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com/v1",
+)
 
 
 # ===============================
