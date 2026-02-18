@@ -29,6 +29,7 @@ wheels/
 
 # Данные и кэши
 chroma_db/
+backend/backend
 backend/backend/vectorstore/qdrant_data/
 backend/hf-cache/
 backend/torch-cache/
@@ -60,3 +61,5 @@ env/
 *.log
 
 #
+runs.db
+
