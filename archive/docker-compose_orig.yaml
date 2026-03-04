@@ -1,0 +1,63 @@
+
+services:
+
+  qdrant:
+    image: qdrant/qdrant:v1.15
+    container_name: qdrant-agents
+    volumes:
+      - ./backend/vectorstore/qdrant_data:/qdrant/storage:z
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    restart: unless-stopped
+    networks:
+      - llmnet
+
+
+
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model Qwen/Qwen3-Embedding-8B
+      --task embed
+      --dtype auto
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization 0.90
+      --download-dir /models
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - VLLM_LOGGING_LEVEL=INFO
+    ports:
+      - "8000:8000"
+#    gpus: all
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]   # required per docs
+
+    volumes:
+      - ./models:/models                  # <— persistent model store
+      - ./hf-cache:/root/.cache/huggingface  # optional: HF cache (still fine to keep)
+      - ./triton-cache:/root/.triton         # optional: compiled Triton kernels
+      - ./torch-cache:/root/.cache/torch     # optional: PyTorch CUDA kernel cache
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+
+
+
+volumes:
+  qdrant_data: {}
+
+networks:
+  llmnet:
+    driver: bridge
