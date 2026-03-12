@@ -1,5 +1,8 @@
-# extract_pst_to_sqlite.py
-import json, sqlite3, os
+# extract_pst_to_sqlite_improved.py
+
+import json
+import sqlite3
+import hashlib
 from pathlib import Path
 from email.parser import HeaderParser
 from email import policy
@@ -7,34 +10,85 @@ from email.utils import getaddresses, parsedate_to_datetime
 from datetime import timezone, datetime
 from tqdm import tqdm
 
+
 PST_DIR = r"E:\outlook"
 ATTACH_DIR = r"E:\outlook\attachments"
 DB_PATH = r"E:\outlook\mail_local.db"
+
 SAVE_ATTACHMENTS = True
 BATCH = 500
 
-def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
+
+# папки которые не хотим индексировать
+IGNORE_FOLDERS = {
+    "conversation history",
+    "skype",
+    "teams"
+}
+
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
 
 def parse_addrs(v):
-    if not v: return []
+    if not v:
+        return []
     return [addr for _, addr in getaddresses([v]) if addr]
 
+
 def parse_date_utc(v):
-    if not v: return datetime(1970,1,1,tzinfo=timezone.utc)
+    if not v:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
     try:
         dt = parsedate_to_datetime(v)
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
         return dt.astimezone(timezone.utc)
+
     except Exception:
-        return datetime(1970,1,1,tzinfo=timezone.utc)
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def is_probably_chat(body_text: str):
+
+    if not body_text:
+        return True
+
+    body = body_text.strip()
+
+    # короткие сообщения почти всегда чат
+    if len(body) < 30:
+        return True
+
+    return False
+
+
+def compute_email_hash(message_id, subject, from_addr, sent_at, body):
+
+    base = message_id
+
+    if not base:
+        base = f"{subject}|{from_addr}|{sent_at}|{body[:200]}"
+
+    return hashlib.md5(
+        base.encode("utf-8", errors="ignore")
+    ).hexdigest()
+
 
 def main():
+
     from libratom.lib.core import open_mail_archive
 
     ensure_dir(Path(ATTACH_DIR))
+
     conn = sqlite3.connect(DB_PATH)
+
     conn.executescript("""
     PRAGMA journal_mode=WAL;
+
     CREATE TABLE IF NOT EXISTS emails(
       id TEXT PRIMARY KEY,
       message_id TEXT,
@@ -46,89 +100,172 @@ def main():
       sent_at_utc TEXT,
       sent_at_raw TEXT,
       folder TEXT,
+      source_pst TEXT,
+      body_len INTEGER,
       body_text TEXT,
       body_html TEXT
     );
+
     CREATE TABLE IF NOT EXISTS attachments(
       email_id TEXT,
       filename TEXT,
       path TEXT,
       size_bytes INTEGER
     );
-    CREATE INDEX IF NOT EXISTS idx_emails_sent ON emails(sent_at_utc);
+
+    CREATE INDEX IF NOT EXISTS idx_emails_sent
+    ON emails(sent_at_utc);
     """)
+
     header_parser = HeaderParser(policy=policy.default)
 
-    emails_buf, atts_buf = [], []
+    emails_buf = []
+    atts_buf = []
+
+    seen_hashes = set()
+
     def flush():
         nonlocal emails_buf, atts_buf
+
         if emails_buf:
-            conn.executemany("""INSERT OR IGNORE INTO emails
+            conn.executemany("""
+            INSERT OR IGNORE INTO emails
             (id,message_id,subject,from_addr_json,to_addr_json,cc_addr_json,bcc_addr_json,
-             sent_at_utc,sent_at_raw,folder,body_text,body_html)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", emails_buf)
+             sent_at_utc,sent_at_raw,folder,source_pst,body_len,body_text,body_html)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, emails_buf)
+
             emails_buf = []
+
         if atts_buf:
-            conn.executemany("""INSERT INTO attachments(email_id,filename,path,size_bytes)
-                                VALUES (?,?,?,?)""", atts_buf)
+            conn.executemany("""
+            INSERT INTO attachments
+            (email_id,filename,path,size_bytes)
+            VALUES (?,?,?,?)
+            """, atts_buf)
+
             atts_buf = []
+
         conn.commit()
 
+
     pst_files = list(Path(PST_DIR).rglob("*.pst"))
+
     for pst in pst_files:
+
         print(f"\nPST: {pst}")
+
         with open_mail_archive(pst) as arc:
+
             for msg in tqdm(arc.messages(), desc=pst.name):
+
                 th = msg.transport_headers or ""
                 h = header_parser.parsestr(th)
 
-                mid   = (h.get("Message-ID") or h.get("Message-Id") or "").strip()
-                subj  = (h.get("Subject") or "").strip()
+                mid = (h.get("Message-ID") or h.get("Message-Id") or "").strip()
+
+                subj = (h.get("Subject") or "").strip()
+
                 from_ = parse_addrs(h.get("From"))
-                to_   = parse_addrs(h.get("To"))
-                cc_   = parse_addrs(h.get("Cc"))
-                bcc_  = parse_addrs(h.get("Bcc"))
+                to_ = parse_addrs(h.get("To"))
+                cc_ = parse_addrs(h.get("Cc"))
+                bcc_ = parse_addrs(h.get("Bcc"))
+
                 rawdt = h.get("Date") or ""
                 dt_utc = parse_date_utc(rawdt)
 
                 body_text = getattr(msg, "plain_text_body", None) or ""
                 body_html = getattr(msg, "html_body", None) or ""
+
                 folder = getattr(msg, "folder_name", None) or "unknown"
 
-                stable_id = mid or f"{pst.name}::{msg.identifier}"
+                # фильтр системных папок
+                if folder.lower() in IGNORE_FOLDERS:
+                    continue
+
+                # фильтр чат сообщений
+                if is_probably_chat(body_text):
+                    continue
+
+                body_len = len(body_text)
+
+                email_hash = compute_email_hash(
+                    mid,
+                    subj,
+                    ",".join(from_),
+                    rawdt,
+                    body_text
+                )
+
+                # дедуп в памяти
+                if email_hash in seen_hashes:
+                    continue
+
+                seen_hashes.add(email_hash)
 
                 emails_buf.append((
-                    stable_id, mid, subj,
+
+                    email_hash,
+                    mid,
+                    subj,
+
                     json.dumps(from_, ensure_ascii=False),
                     json.dumps(to_, ensure_ascii=False),
                     json.dumps(cc_, ensure_ascii=False),
                     json.dumps(bcc_, ensure_ascii=False),
-                    dt_utc.isoformat(), rawdt, folder, body_text, body_html
+
+                    dt_utc.isoformat(),
+                    rawdt,
+                    folder,
+
+                    pst.name,
+
+                    body_len,
+                    body_text,
+                    body_html
                 ))
 
                 # вложения
                 for att in getattr(msg, "attachments", []):
-                    fname = (att.name or f"att_{att.identifier}").replace("\\","_").replace("/","_")
+
+                    fname = (att.name or f"att_{att.identifier}") \
+                        .replace("\\", "_") \
+                        .replace("/", "_")
+
                     size = int(getattr(att, "size", 0) or 0)
+
                     fpath = ""
+
                     if SAVE_ATTACHMENTS:
+
                         try:
+
                             data = att.read_buffer(size) if size else att.read()
-                            dest = Path(ATTACH_DIR)/pst.stem/str(msg.identifier)
+
+                            dest = Path(ATTACH_DIR) / pst.stem / str(msg.identifier)
+
                             ensure_dir(dest)
-                            fp = dest/fname
+
+                            fp = dest / fname
+
                             fp.write_bytes(data or b"")
+
                             fpath = str(fp)
+
                         except Exception:
                             pass
-                    atts_buf.append((stable_id, fname, fpath, size))
+
+                    atts_buf.append((email_hash, fname, fpath, size))
 
                 if len(emails_buf) >= BATCH or len(atts_buf) >= BATCH:
                     flush()
 
     flush()
+
     conn.close()
-    print(f"Готово. SQLite: {DB_PATH}")
+
+    print(f"\nГотово. SQLite: {DB_PATH}")
+
 
 if __name__ == "__main__":
     main()
