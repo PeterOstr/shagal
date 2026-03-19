@@ -1,10 +1,13 @@
+DROP TABLE IF EXISTS mailkb.threads;
+
 CREATE TABLE mailkb.threads
 (
-    thread_id String,
+    thread_key String,
     subject_norm String,
-    emails_count UInt32,
+    subject String,
+    unique_emails_count UInt32,
     first_sent_at DateTime64(3, 'UTC'),
     last_sent_at DateTime64(3, 'UTC')
 )
 ENGINE = ReplacingMergeTree
-ORDER BY thread_id;
+ORDER BY thread_key;
