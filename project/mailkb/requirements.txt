@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+pandas
+clickhouse-connect
+qdrant-client
+langchain
+langchain-core
+langchain-openai
+langchain-qdrant
