@@ -5,7 +5,7 @@ from langchain.tools import tool
 from langchain.agents.middleware import PIIMiddleware, SummarizationMiddleware
 
 
-SUMMARY_DIR = Path("summaries")
+SUMMARY_DIR = Path("../../summaries")
 SUMMARY_DIR.mkdir(exist_ok=True)
 
 

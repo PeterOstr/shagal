@@ -1,29 +1,23 @@
 from functools import lru_cache
 
 import clickhouse_connect
+from langchain.agents import create_agent
 from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
-from .config import (
+from config import (
     CH_HOST,
     CH_PORT,
+    CLICKHOUSE_DATABASE,
     CLICKHOUSE_PASSWORD,
     CLICKHOUSE_USER,
     EMBEDDINGS_BASE_URL,
     EMBEDDINGS_MODEL,
-    MESSAGES_COLLECTION,
+    LLM_MODEL,
     QDRANT_URL,
-    THREADS_COLLECTION,
 )
-
-
-@lru_cache(maxsize=1)
-def get_qdrant_client() -> QdrantClient:
-    if not QDRANT_URL:
-        raise ValueError("QDRANT_URL is not set")
-    return QdrantClient(url=QDRANT_URL)
 
 
 @lru_cache(maxsize=1)
@@ -33,11 +27,17 @@ def get_clickhouse_client():
         port=CH_PORT,
         username=CLICKHOUSE_USER,
         password=CLICKHOUSE_PASSWORD,
+        database=CLICKHOUSE_DATABASE,
     )
 
 
 @lru_cache(maxsize=1)
-def get_embeddings() -> OpenAIEmbeddings:
+def get_qdrant_client():
+    return QdrantClient(url=QDRANT_URL)
+
+
+@lru_cache(maxsize=1)
+def get_embeddings():
     return OpenAIEmbeddings(
         model=EMBEDDINGS_MODEL,
         api_key="not-needed",
@@ -80,9 +80,9 @@ def ensure_collection(collection_name: str, recreate: bool = False) -> QdrantVec
     )
 
 
-def get_messages_store(recreate: bool = False) -> QdrantVectorStore:
-    return ensure_collection(MESSAGES_COLLECTION, recreate=recreate)
-
-
-def get_threads_store(recreate: bool = False) -> QdrantVectorStore:
-    return ensure_collection(THREADS_COLLECTION, recreate=recreate)
+def build_structured_agent(response_format):
+    return create_agent(
+        model=LLM_MODEL,
+        tools=[],
+        response_format=response_format,
+    )

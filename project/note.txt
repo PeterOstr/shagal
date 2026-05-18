@@ -1,0 +1,384 @@
+Запуск:
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8010
+
+Да. Вот **простая памятка по твоей текущей MVP-структуре**, без переусложнения.
+
+
+
+
+### `project/`
+
+Корень backend-проекта.
+Из **этой папки** ты запускаешь:
+
+```powershell
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8010
+```
+
+### `summaries/`
+
+Папка, куда batch-agent складывает промежуточные summary-файлы.
+
+### `.env`
+
+Конфиги окружения:
+
+* `QDRANT_URL`
+* `CH_HOST`
+* `CH_PORT`
+* `CLICKHOUSE_USER`
+* `CLICKHOUSE_PASSWORD`
+* `EMBEDDINGS_BASE_URL`
+* `EMBEDDINGS_MODEL`
+
+### `requirements.txt`
+
+Все зависимости backend-сервиса.
+
+---
+
+# Папка `app/`
+
+Это **внешний слой приложения**, то есть FastAPI API.
+
+## `app/main.py`
+
+**Точка входа FastAPI**.
+
+Что делает:
+
+* создаёт объект `app = FastAPI(...)`
+* подключает роуты
+
+То есть это файл, на который смотрит `uvicorn`:
+
+```powershell
+uvicorn app.main:app ...
+```
+
+---
+
+## `app/api.py`
+
+**Все HTTP-эндпоинты**.
+
+Что здесь должно быть:
+
+* `/api/health`
+* `/api/ingest/messages`
+* `/api/ingest/threads`
+* `/api/search/threads`
+* `/api/corpus/batch`
+* `/api/agents/batch`
+* `/api/agents/global`
+* `/api/summaries/clear`
+
+Идея:
+
+* принимает запрос
+* вызывает функцию из `mailkb`
+* возвращает JSON-ответ
+
+То есть это **тонкая обёртка над ядром**.
+
+---
+
+## `app/schemas.py`
+
+**Pydantic-схемы для API**.
+
+Что здесь должно быть:
+
+* модели входных данных request
+* модели response, если хочешь типизировать ответы
+
+Примеры:
+
+* `IngestMessagesRequest`
+* `SearchThreadsRequest`
+* `CorpusBatchRequest`
+* `RunBatchAgentRequest`
+
+Идея:
+
+* валидирует входящие данные
+* делает API аккуратнее и понятнее
+
+---
+
+## `app/deps.py`
+
+**Вспомогательные зависимости для FastAPI**.
+
+Для MVP здесь можно держать:
+
+* deep health check
+* проверку соединений с ClickHouse / Qdrant / embeddings
+
+Если по-простому:
+
+* это файл для всякой API-обвязки, которая **не является бизнес-логикой**
+
+---
+
+## `app/__init__.py`
+
+Просто делает `app/` Python-пакетом.
+Обычно пустой.
+
+---
+
+# Папка `mailkb/`
+
+Это **ядро приложения**, то есть вся реальная логика.
+
+---
+
+## `mailkb/config.py`
+
+**Центральное место для конфигов**.
+
+Что здесь должно быть:
+
+* загрузка `.env`
+* чтение переменных окружения
+* имена коллекций
+* пути типа `SUMMARY_DIR`
+* значения по умолчанию
+
+Примерно:
+
+* `QDRANT_URL`
+* `CH_HOST`
+* `MESSAGES_COLLECTION`
+* `THREADS_COLLECTION`
+* `SUMMARY_DIR`
+
+Идея:
+
+* чтобы настройки были в одном месте, а не размазаны по коду
+
+---
+
+## `mailkb/infra.py`
+
+**Подключения к внешним системам**.
+
+Что здесь должно быть:
+
+* `get_clickhouse_client()`
+* `get_qdrant_client()`
+* `get_embeddings()`
+* `ensure_collection()`
+* `get_messages_store()`
+* `get_threads_store()`
+
+Идея:
+
+* здесь всё про инфраструктуру
+* **никакой бизнес-логики**
+* только создание клиентов, коллекций и подключений
+
+---
+
+## `mailkb/ingestion.py`
+
+**Загрузка и подготовка данных**.
+
+Что здесь должно быть:
+
+* SQL-запросы к ClickHouse
+* функции чтения батчей
+* разбор `parsed_json`
+* построение `Document`
+* загрузка документов в Qdrant
+
+Основные зоны:
+
+1. утилиты для subject / participants / json
+2. `load_join_batch()`
+3. `load_all_joined_df()`
+4. `build_message_docs()`
+5. `upload_message_docs()`
+6. `ingest_messages()`
+7. `build_thread_docs()`
+8. `ingest_threads()`
+
+Идея:
+
+* весь pipeline индексации лежит здесь
+
+---
+
+## `mailkb/tools.py`
+
+**Инструменты для retrieval и работы агентов**.
+
+Что здесь должно быть:
+
+* `search_project_threads`
+* `get_project_corpus_batch`
+* `save_summary`
+* `load_all_summaries`
+* `clear_summaries`
+
+Идея:
+
+* это прикладные функции, которыми пользуются агенты и API
+
+То есть:
+
+* retrieval по тредам
+* выдача батчей корпуса
+* работа с summary-файлами
+
+---
+
+## `mailkb/agents.py`
+
+**Создание и настройка агентов**.
+
+Что здесь должно быть:
+
+* `SYSTEM_PROMPT_BATCH`
+* `SYSTEM_PROMPT_GLOBAL`
+* `build_batch_agent()`
+* `build_global_agent()`
+
+Идея:
+
+* здесь живёт только агентная логика
+* промпты
+* middleware
+* сборка agent objects
+
+То есть:
+
+* `tools.py` = инструменты
+* `agents.py` = кто и как этими инструментами пользуется
+
+---
+
+## `mailkb/main.py`
+
+**Локальная CLI-точка входа**, не FastAPI.
+
+Для чего:
+
+* ручной запуск ingestion
+* ручной запуск поиска
+* ручной запуск batch/global agent
+* локальные тесты без API
+
+Примеры:
+
+```powershell
+python -m mailkb.main ingest-messages
+python -m mailkb.main ingest-threads
+python -m mailkb.main search-threads Segezha
+```
+
+Идея:
+
+* это внутренний удобный CLI для тебя
+* не обязателен для API, но очень полезен
+
+---
+
+## `mailkb/__init__.py`
+
+Делает `mailkb/` Python-пакетом.
+Обычно почти пустой.
+
+---
+
+# Самая простая логика по слоям
+
+Вот запомни это как основу:
+
+## `app/`
+
+**как внешний мир общается с сервисом**
+
+## `mailkb/`
+
+**что сервис реально умеет делать**
+
+---
+
+# В одном предложении по каждому файлу
+
+### `app/main.py`
+
+Запуск FastAPI приложения.
+
+### `app/api.py`
+
+Все HTTP-эндпоинты.
+
+### `app/schemas.py`
+
+Схемы запросов и ответов.
+
+### `app/deps.py`
+
+API-вспомогалки и health/deps.
+
+### `mailkb/config.py`
+
+Все настройки и env.
+
+### `mailkb/infra.py`
+
+Подключения: Qdrant, ClickHouse, embeddings.
+
+### `mailkb/ingestion.py`
+
+Загрузка, разбор и индексация писем/тредов.
+
+### `mailkb/tools.py`
+
+Retrieval + summary tools.
+
+### `mailkb/agents.py`
+
+Промпты и сборка агентов.
+
+### `mailkb/main.py`
+
+CLI для ручного запуска.
+
+---
+
+# Что не надо пихать куда попало
+
+Чтобы не путаться дальше:
+
+## В `app/` не надо класть
+
+* SQL
+* Qdrant-логику
+* parsing
+* ingest pipeline
+* agent prompts
+
+## В `mailkb/` не надо класть
+
+* FastAPI router
+* HTTPException
+* request/response модели API
+
+---
+
+# Самая правильная mental model
+
+Представь так:
+
+## `mailkb`
+
+двигатель
+
+## `app`
+
+панель управления двигателем
+

@@ -63,3 +63,7 @@ env/
 #
 runs.db
 
+# шпаргалка внутренняя
+./project/note.txt
+
+./project/config.py

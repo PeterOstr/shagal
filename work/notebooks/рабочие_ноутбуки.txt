@@ -1,0 +1,3419 @@
+mail_deduplication.ipynb
+
+#%%
+import pandas as pd
+import clickhouse_connect
+from datetime import datetime
+
+
+
+
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+#%%
+
+# создаём клиент
+# client = clickhouse_connect.get_client(
+#     host= os.getenv("CLICKHOUSE_HOST") ,   # замени на свой хост/адрес
+#     port= os.getenv("CLICKHOUSE_PORT"),
+#     username=  os.getenv("CLICKHOUSE_USER"),
+#     password= os.getenv("CLICKHOUSE_PASSWORD")
+# )
+client = clickhouse_connect.get_client(
+    host="84.201.160.255",   # замени на свой хост/адрес
+    port=8123,
+    username="peter",
+    password="1234"
+)
+#%% md
+##### заносим в таблицу email_unique только уникальные, очищенные от повторов письма (посленее письмо в цепочке) чтобы уменьшить количество писем для обработки
+#%%
+import pandas as pd
+
+CHUNK_SIZE = 20000
+
+
+def dedup_thread(df_thread):
+
+    rows = df_thread.sort_values(
+        by="body_text",
+        key=lambda x: x.str.len(),
+        ascending=False
+    )
+
+    kept = []
+
+    for _, row in rows.iterrows():
+
+        body = row["body_text"]
+
+        duplicate = False
+
+        for k in kept:
+            if body in k["body_text"]:
+                duplicate = True
+                break
+
+        if not duplicate:
+            kept.append(row)
+
+    return pd.DataFrame(kept)
+
+
+offset = 0
+
+while True:
+
+    query = f"""
+    SELECT
+        id,
+        thread_key,
+        message_id,
+        subject,
+        from_addr,
+        to_addr,
+        sent_at_utc,
+        folder,
+        body_text
+    FROM mailkb.emails
+    WHERE body_text IS NOT NULL
+    ORDER BY thread_key, sent_at_utc
+    LIMIT {CHUNK_SIZE}
+    OFFSET {offset}
+    """
+
+    df = client.query_df(query)
+
+    if df.empty:
+        break
+
+    print("Loaded rows:", len(df))
+
+    result = []
+
+    for thread_key, df_thread in df.groupby("thread_key"):
+
+        deduped = dedup_thread(df_thread)
+
+        result.append(deduped)
+
+    df_result = pd.concat(result)
+
+    rows = df_result.values.tolist()
+
+    client.insert(
+        "mailkb.emails_unique",
+        rows,
+        column_names=df_result.columns.tolist()
+    )
+
+    print("Inserted:", len(rows))
+
+    offset += CHUNK_SIZE
+#%%
+
+
+mail_processing.ipynb
+
+
+#%%
+
+#%% md
+### вариант обработки mbox от 12.03.26
+#%%
+import mailbox
+
+
+#%%
+from email.header import decode_header
+
+def decode_mime(value):
+    if not value:
+        return ""
+
+    parts = decode_header(value)
+
+    result = ""
+
+    for text, encoding in parts:
+
+        if isinstance(text, bytes):
+
+            try:
+                result += text.decode(encoding or "utf-8", errors="ignore")
+            except Exception:
+                result += text.decode("utf-8", errors="ignore")
+
+        else:
+            result += text
+
+    return result
+#%%
+import mailbox
+
+mbox = mailbox.mbox(r"E:\outlook\mbox\Архивы\Входящие\mbox")
+
+for i, msg in enumerate(mbox):
+    print(decode_mime(msg["Subject"]))
+    break
+#%%
+from pathlib import Path
+
+for p in Path(r"E:\outlook\mbox").rglob("mbox"):
+    print(p)
+#%%
+import os
+import uuid
+import mailbox
+
+from pathlib import Path
+from datetime import datetime, timezone
+
+from email.utils import getaddresses, parsedate_to_datetime
+from email.header import decode_header
+
+from tqdm import tqdm
+import clickhouse_connect
+from bs4 import BeautifulSoup
+
+
+#%%
+
+
+CH_HOST = '84.201.160.255'
+CH_PORT = 8123
+CH_USER = 'peter'
+CH_PASS = '1234'
+CH_DB = "mailkb"
+
+MBOX_DIR = r"E:\outlook\mbox"
+ATTACH_DIR = r"E:\outlook\attachments"
+
+SAVE_ATTACHMENTS = True
+BATCH = 500
+
+client = clickhouse_connect.get_client(
+    host=CH_HOST,
+    port=CH_PORT,
+    username=CH_USER,
+    password=CH_PASS,
+    database=CH_DB
+)
+
+
+
+#%%
+def decode_mime(value):
+    if not value:
+        return ""
+
+    parts = decode_header(value)
+    result = ""
+
+    for text, encoding in parts:
+        if isinstance(text, bytes):
+            try:
+                result += text.decode(encoding or "utf-8", errors="ignore")
+            except Exception:
+                result += text.decode("utf-8", errors="ignore")
+        else:
+            result += str(text)
+
+    return result
+
+
+def parse_addrs(value):
+    if not value:
+        return []
+
+    decoded = decode_mime(value)
+    return [addr for _, addr in getaddresses([decoded]) if addr]
+
+
+def parse_date(value):
+    if not value:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    try:
+        dt = parsedate_to_datetime(value)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
+    except Exception:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def ensure_dir(p):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def iter_mbox_files(base):
+    for mbox_path in Path(base).rglob("mbox"):
+        if mbox_path.is_file():
+            yield mbox_path
+
+
+def extract_body(msg):
+    body_text = ""
+    body_html = ""
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                continue
+
+            ctype = part.get_content_type()
+
+            try:
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+
+                charset = part.get_content_charset() or "utf-8"
+                content = payload.decode(charset, errors="ignore")
+            except Exception:
+                continue
+
+            if ctype == "text/plain" and not body_text:
+                body_text = content
+            elif ctype == "text/html" and not body_html:
+                body_html = content
+
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                content = payload.decode(charset, errors="ignore")
+
+                if msg.get_content_type() == "text/html":
+                    body_html = content
+                else:
+                    body_text = content
+        except Exception:
+            pass
+
+    return body_text, body_html
+
+
+def ingest():
+    emails_rows = []
+    attach_rows = []
+
+    ensure_dir(ATTACH_DIR)
+
+    for mbox_path in iter_mbox_files(MBOX_DIR):
+        print("Processing:", mbox_path)
+
+        folder_name = str(mbox_path.parent.relative_to(MBOX_DIR))
+        mbox = mailbox.mbox(str(mbox_path))
+
+        for msg in tqdm(mbox, desc=folder_name):
+            stable_id = str(uuid.uuid4())
+
+            message_id = str((msg.get("Message-ID") or msg.get("Message-Id") or "").strip())
+            subject = str(decode_mime(msg.get("Subject", "")) or "")
+
+            from_addr = parse_addrs(msg.get("From"))
+            to_addr = parse_addrs(msg.get("To"))
+            cc_addr = parse_addrs(msg.get("Cc"))
+            bcc_addr = parse_addrs(msg.get("Bcc"))
+
+            raw_date_value = msg.get("Date")
+            sent_raw = "" if raw_date_value is None else str(raw_date_value)
+            sent_utc = parse_date(raw_date_value)
+
+            thread_id = str(
+                msg.get("Thread-Index")
+                or msg.get("References")
+                or msg.get("In-Reply-To")
+                or ""
+            )
+
+            body_text, body_html = extract_body(msg)
+
+            if not body_text and body_html:
+                body_text = BeautifulSoup(body_html, "lxml").get_text("\n")
+
+            body_text = "" if body_text is None else str(body_text)
+            body_html = "" if body_html is None else str(body_html)
+
+            if not body_text and not subject:
+                continue
+
+            emails_rows.append([
+                stable_id,
+                message_id,
+                thread_id,
+                subject,
+                from_addr,
+                to_addr,
+                cc_addr,
+                bcc_addr,
+                sent_utc,
+                sent_raw,
+                folder_name,
+                body_text,
+                body_html
+            ])
+
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_disposition() != "attachment":
+                        continue
+
+                    fname = part.get_filename() or "attachment"
+                    fname = decode_mime(fname)
+                    fname = fname.replace("\\", "_").replace("/", "_")
+
+                    data = part.get_payload(decode=True)
+                    if not data:
+                        continue
+
+                    size = len(data)
+                    fpath = ""
+
+                    if SAVE_ATTACHMENTS:
+                        try:
+                            dest_dir = Path(ATTACH_DIR) / folder_name / stable_id
+                            ensure_dir(dest_dir)
+
+                            dest_fp = dest_dir / fname
+                            dest_fp.write_bytes(data)
+
+                            fpath = str(dest_fp)
+                        except Exception:
+                            pass
+
+                    attach_rows.append([
+                        stable_id,
+                        fname,
+                        fpath,
+                        int(size)
+                    ])
+
+            if len(emails_rows) >= BATCH:
+                client.insert(
+                    "mailkb.emails",
+                    emails_rows,
+                    column_names=[
+                        "id",
+                        "message_id",
+                        "thread_id",
+                        "subject",
+                        "from_addr",
+                        "to_addr",
+                        "cc_addr",
+                        "bcc_addr",
+                        "sent_at_utc",
+                        "sent_at_raw",
+                        "folder",
+                        "body_text",
+                        "body_html"
+                    ]
+                )
+                emails_rows.clear()
+
+            if len(attach_rows) >= BATCH:
+                client.insert(
+                    "mailkb.attachments",
+                    attach_rows,
+                    column_names=[
+                        "email_id",
+                        "filename",
+                        "path",
+                        "size_bytes"
+                    ]
+                )
+                attach_rows.clear()
+
+    if emails_rows:
+        client.insert(
+            "mailkb.emails",
+            emails_rows,
+            column_names=[
+                "id",
+                "message_id",
+                "thread_id",
+                "subject",
+                "from_addr",
+                "to_addr",
+                "cc_addr",
+                "bcc_addr",
+                "sent_at_utc",
+                "sent_at_raw",
+                "folder",
+                "body_text",
+                "body_html"
+            ]
+        )
+
+    if attach_rows:
+        client.insert(
+            "mailkb.attachments",
+            attach_rows,
+            column_names=[
+                "email_id",
+                "filename",
+                "path",
+                "size_bytes"
+            ]
+        )
+
+
+if __name__ == "__main__":
+    ingest()
+    print("Done.")
+#%%
+
+
+output_parser.ipynb
+
+#%%
+
+from langchain.chat_models import init_chat_model
+from langchain_tavily import TavilySearch
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from dotenv import load_dotenv
+from langchain_openai import OpenAIEmbeddings
+from dotenv import load_dotenv
+from langsmith.client import dump_model
+
+load_dotenv()
+import os
+
+from typing import List, Optional
+import os
+from pathlib import Path
+
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from fastapi import FastAPI, UploadFile, File
+import pandas as pd
+import numpy as np
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticOutputParser
+
+
+#%%
+mail_raw = """
+Виталий, хотел с Вами связаться по поводу гайд по п.2.6. – обсудить, т.к. не совсем понял, если честно.
+
+
+
+Мой телефон – 8916-936-03-32
+
+
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com]
+Sent: Friday, February 9, 2018 12:39 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru>
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com>; Lyovkin Boris <boris.lyovkin@bearingpoint.ru>; Katushenko Kate <kate.katushenko@bearingpoint.ru>
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, Петр!
+
+
+
+Спасибо за примеры, проверил на них удаление лота. Теперь должно быть правильно.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru]
+Sent: Friday, February 09, 2018 1:47 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день!
+
+Примеры
+
+41…703
+
+41…704
+
+41…705
+
+
+
+Сейчас по 2.6 отпишусь
+
+
+
+
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Thursday, February 8, 2018 8:03 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, Петр!
+
+
+
+У нас было три пункта для исправлений.
+
+По релевантным перевозчикам изменения в логику внес, этот пункт можно протестировать.
+
+По ошибке с удалением лота, с виду должно быть в порядке, но чтобы удостовериться, нужны примеры. Сейчас в ПУТе остался всего один ФЗ. На одном ФЗ этот пункт нормально протестировать не получится. Можете сделать побольше тестовых данных?
+
+По поводу п.2.6., вы предлагали использовать один из двух BADI (ранее в переписке), хорошо, но я плохо представляю как эта часть работает в режиме пользователя. Вы можете сделать мини инструкцию по этой части с примером? Так я смогу проверить логику перед передачей в тест.
+
+
+
+Итого нужны новые тестовые данные в ПУТ и гайд по п.2.6.
+
+А тем временем можете проверить проверку на перевозчиков.
+
+
+
+Спасибо.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru]
+Sent: Thursday, February 08, 2018 5:46 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день!
+
+Хотел у вас уточнить статус по тм014, когда можно продолжать тестировать с исправлениями?
+
+
+
+С уважением, Острик Петр
+
+
+
+
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Monday, January 29, 2018 3:05 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день!
+
+
+
+Хорошо, буду это учитывать.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru]
+Sent: Monday, January 29, 2018 5:01 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Виталий,
+
+Добрый День!
+
+
+
+По поводу пункта :
+
+По итогам тендера не выполняется проверка п.2.6 -
+
+Лот может быть выигран только целиком, иначе он расформировывается.
+
+В нашем примере 1 фз выиграл один перевозчик, два другой, соответственно, они и присвоились (ошибка).
+
+
+
+Здесь достаточно выводить предупреждение, что тендер Лотом не состоялся, Логист должен сам вручную расформировать лот.
+
+
+
+С уважением, Острик Петр
+
+
+
+
+
+From: Ostrik Petr
+Sent: Wednesday, January 24, 2018 8:10 PM
+To: 'Pristupov Vitaliy' <Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, Виталий!
+
+
+
+Вы правы, если находясь в пульте вызвать список экспедиторов и при этом не сохраниться, то список не попадет в талблицы и соответственно проверка не будет успешной. Для устранения, соответственно, необходимо брать данные из ПУТа до сохранения.
+
+
+
+Если выделить ФЗ лота и нажать – удалить Лот, то он пропадет только из самого верхнего ФЗ.
+
+
+
+По итогам тендера не выполняется проверка п.2.6 -
+
+Лот может быть выигран только целиком, иначе он расформировывается.
+
+В нашем примере 1 фз выиграл один перевозчик, два другой, соответственно, они и присвоились (ошибка).
+
+
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com]
+Sent: Wednesday, January 24, 2018 7:21 AM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, Петр!
+
+
+
+Посмотрел ваш пример.
+
+Он вроде бы и корректный, но тут есть кое что странное.
+
+Вы прислали скрин, на котором экспедиторы существуют, однако, например, для ФЗ 4100000662 (ключ объекта 005056B45C901ED7BFEEE69DDC3160D0) в таблице /SCMTMS/D_TORRL (что соответствует узлу TOR.RANKINGLIST) нет к ней записей.
+
+Если попробовать посмотреть этот же ФЗ через транзакцию BOBT, то связка с экспедиторами также отсутствует.
+
+Опираясь на все это, логика программы считает, что экспедиторов нет.
+
+Можете проверить, действительно ли экспедиторы привязаны к ФЗ?
+
+
+
+Спасибо.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru]
+Sent: Tuesday, January 23, 2018 5:16 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день!
+
+
+
+Примеры составлены корректно?
+
+
+
+С уважением, Острик Петр
+
+
+
+From: Ostrik Petr
+Sent: Monday, January 22, 2018 4:57 PM
+To: 'Pristupov Vitaliy' <Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день,
+
+
+
+Не работает создание лота – проблема с проверкой перевозчиков.
+
+Во всех трех заказах из примера – одинаковый набор перевозчиков.
+
+
+
+Однако лот не создается. Пишет
+
+
+
+
+
+
+
+Пример в TPR610
+
+
+
+
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com]
+Sent: Monday, January 15, 2018 5:57 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Проверки в ПУТ доработал, можно попробовать еще раз.
+
+По поводу отсутствия номера лота на портале, средствами ABAP можно добавить поле только в конец таблицы, оно сейчас там есть (закладка Запросы фрахта, скрин ниже).
+
+Дамп на портале исправил.
+
+
+
+
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru]
+Sent: Monday, January 15, 2018 7:23 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: FW: ПУТ (ТМ014)
+
+
+
+UPD. А еще в дамп упало
+
+
+
+
+
+
+
+
+
+
+
+
+
+From: Ostrik Petr
+Sent: Monday, January 15, 2018 5:11 PM
+To: 'Pristupov Vitaliy' <Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, по поводу проверки – подкорректировал немного, желтым выделил.
+
+
+
+По – поводу теста – не смог сформировать *632, *633 выдает
+
+
+
+Не могу найти поле с лотом на портале
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com]
+Sent: Monday, January 15, 2018 3:52 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Петр, в общем, можете начинать тестировать.
+
+Отклонения возможны, поэтому если что то пойдет не так, то присылайте конкретный пример с указанием набора ФЗ и конкретной операции, которая дала сбой. Это ускорит мне работу.
+
+Либо если нужны корректировки логики, то тоже указывайте. Спорных моментов можно придумать много.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Monday, January 15, 2018 12:41 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день!
+
+У меня в ПУТ пропали этапы ЕФ (там горизонт планирования 5 дней был), а ЗФ на месте.
+
+У вас что конкретно пропало?
+
+
+
+
+
+С уважением, Острик Петр
+
+
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Saturday, January 13, 2018 12:54 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Петр, добрый день!
+
+
+
+Хотел сегодня поотлаживать функции, но из ПУТа кажется исчезли все данные. Это так и должно быть?
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Friday, January 12, 2018 5:35 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, попытайтесь сейчас, а вообще я нашел неточность в своей спеке, сейчас подправлю
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Friday, January 12, 2018 1:58 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Петр, сейчас при попытке отправить ФЗ 4100000621 на конкурс вижу ошибку, что он не в статусе 03.
+
+У нее есть лот, поэтому я хотел попробовать отправить этот ФЗ на портал.
+
+Можно как то поправить ошибку со статусом?
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Friday, January 12, 2018 3:08 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+
+
+Если не появляется убедитесь что запрос отправлен
+
+
+
+
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Friday, January 12, 2018 12:47 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Хорошо, получилось отправить на конкурс один ФЗ, где теперь его можно увидеть на портале?
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Friday, January 12, 2018 2:42 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Попробуйте пожалуйста те же, я разблокировал ДП zcarrier01, если вы об этом.
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Friday, January 12, 2018 12:41 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Петр, можете предоставить еще пример ФЗ, который можно отправить на конкурс без ошибок (где не блокирован ДП)?
+
+
+
+Спасибо.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Friday, January 12, 2018 12:18 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+По второму пункту наврал! Можем отправить и лоты и единичные ФЗ, просто при этом для лота должна осуществляться проверка полноты выделения.
+
+
+
+From: Ostrik Petr
+Sent: Friday, January 12, 2018 10:15 AM
+To: 'Pristupov Vitaliy' <Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день!
+
+
+
+1.       Да, так можно
+
+2.       Да, вы правы, получается оправляем либо только лоты отдельно, либо только единичные ФЗ
+
+
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Friday, January 12, 2018 8:34 AM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, Петр!
+
+
+
+Пара уточняющих вопросов по отправке на конкурс:
+
+1.       Если выделены ФЗ, присвоенные трем разным лотам, но по каждому лоту при этом выделены все ФЗ, то так можно отправить на конкурс?
+
+2.       Если пытаемся отправить на конкурс ФЗ без присвоенного лота, это корректно? Если да, то при этом выходит должны быть выделены только ФЗ без лота.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Thursday, January 11, 2018 7:23 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Если есть возможность встройки проверки для стандартной кнопки, то отдельная кнопка не нужна. Но при выделении одного ФЗ из списка лота при отправке выдавать сообщение “Для Лота N XXX не выбраны все ФЗ”.
+
+Причем если выбраны два ФЗ из двух разных лотов, то дважды вывести данное сообщение (для каждого лота соотвественно).
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Thursday, January 11, 2018 5:05 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+А раз это она и есть, то тогда я правильно понимаю, что мы создаем новую кнопку только ради одной проверки?
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Thursday, January 11, 2018 6:51 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris; Katushenko Kate
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Да, это она и имеется ввиду.
+
+
+
+С уваженем, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Thursday, January 11, 2018 2:06 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >; Katushenko Kate <kate.katushenko@bearingpoint.ru <mailto:kate.katushenko@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Петр, еще вопрос для понимания – у нас планируется кнопка «Отправить лот на конкурс».
+
+Эта кнопка как то связана со стандартной кнопкой «Конкурс->Запуск»?
+
+Просто в спеке в п.2.5. коротко указано «Запустить конкурс и создать запросы фрахта…».
+
+Если кнопки не связаны, то тогда раскройте немного что должно происходить по этой кнопке помимо проверок запуска конкурса. В чем заключается запуск конкурса.
+
+
+
+
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Thursday, January 11, 2018 1:35 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Да, именного так - каждый с каждым из выбранного набора ФЗ.
+
+
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Thursday, January 11, 2018 11:34 AM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >; Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+А, понятно, то есть проверяем не любой, а каждый с каждым до тех пор, пока не останутся только общие для всех перевозчики.
+
+И уже по результату делать вывод создавать лот или нет.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Thursday, January 11, 2018 12:27 PM
+To: Pristupov Vitaliy
+Cc: Noskova Kseniya; Lyovkin Boris
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, Виталий!
+
+
+
+В том и был замысел. Берется набор ФЗ, и если в каких-то ФЗ в ранговых списках нет общего перевозчика, то он выкидывается и у остальных тоже. Остаются только те перевозчики, которые являются общими для данной выборки.
+
+
+
+С уважением, Острик Петр
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Thursday, January 11, 2018 9:22 AM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Noskova Kseniya <Kseniya.Noskova@bcsoft.com <mailto:Kseniya.Noskova@bcsoft.com> >
+Subject: RE: ПУТ (ТМ014)
+
+
+
+Добрый день, Петр!
+
+
+
+Возник вопрос по п.2.3.2. спеки.
+
+В нем сказано, что для проверки подойдет любой ФЗ и на его основе проводится проверка наличия перевозчиков.
+
+Но тогда если я, например, захочу добавить в один лот сразу 10 ФЗ (по выделению), то по каким то из них общий перевозчик будет существовать, а по каким то нет.
+
+Соответственно и проверка может отработать не корректно.
+
+Другими словами, брать случайный ФЗ для проверки несколько странно.
+
+Или все таки все окей?
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Wednesday, January 10, 2018 8:21 PM
+To: Pristupov Vitaliy
+Cc: Lyovkin Boris
+Subject: RE: ПУТ
+
+
+
+Теперь работает.
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Wednesday, January 10, 2018 6:19 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >
+Subject: RE: ПУТ
+
+
+
+Хм, интересно, а попробуйте теперь.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Стахановская, 54Б, Пермь, Россия, 614066
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Wednesday, January 10, 2018 8:10 PM
+To: Pristupov Vitaliy
+Cc: Lyovkin Boris
+Subject: RE: ПУТ
+
+
+
+Виталий, у нас опять дампит ПУТ. Вы работаете?
+
+С уважением, Острик Петр
+
+
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Wednesday, January 10, 2018 12:25 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Cc: Lyovkin Boris <boris.lyovkin@bearingpoint.ru <mailto:boris.lyovkin@bearingpoint.ru> >
+Subject: RE: ПУТ
+
+
+
+Кажется починилось, по крайней мере у меня по данному сценарию что то создалось (надеюсь ничего не запорол при этом).
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Клары Цеткин, 10А, Пермь, Россия, 614010
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Wednesday, January 10, 2018 2:14 PM
+To: Pristupov Vitaliy
+Cc: Lyovkin Boris
+Subject: RE: ПУТ
+
+
+
+Падает,
+
+ПУТ-> выделить ЕФ-> создать документ мощности -> дамп
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Wednesday, January 10, 2018 12:07 PM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Subject: RE: ПУТ
+
+
+
+Ну даже не знаю, сейчас я выключил все свои наработки для чистоты эксперимента.
+
+Попробуйте еще раз.
+
+Если все равно будет падать, то вышлите мне последовательность шагов для повторения ошибки.
+
+С ПУТ больше никто не работает случаем?
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Клары Цеткин, 10А, Пермь, Россия, 614010
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Wednesday, January 10, 2018 1:58 PM
+To: Pristupov Vitaliy
+Subject: RE: ПУТ
+
+
+
+Падает
+
+
+
+
+
+From: Pristupov Vitaliy [mailto:Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com> ]
+Sent: Wednesday, January 10, 2018 11:57 AM
+To: Ostrik Petr <petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> >
+Subject: RE: ПУТ
+
+
+
+Петр, сейчас дампов нет?
+
+Если все хорошо, то прошу написать, когда я могу продолжить работу.
+
+Спасибо.
+
+
+
+С уважением,
+
+Виталий Приступов
+
+Разработчик
+
+Т + 7 342 258 00 62 доб. 473 | Vitaliy.Pristupov@bcsoft.com <mailto:Vitaliy.Pristupov@bcsoft.com>
+
+АО БК Софт | ул. Клары Цеткин, 10А, Пермь, Россия, 614010
+
+
+
+From: Ostrik Petr [mailto:petr.ostrik@bearingpoint.ru <mailto:petr.ostrik@bearingpoint.ru> ]
+Sent: Wednesday, January 10, 2018 12:55 PM
+To: Pristupov Vitaliy
+Cc: Lyovkin Boris
+Subject: ПУТ
+
+
+
+Добрый день!
+
+Мне очень нужно сделать пример для программиста, но падает в дамп при планировании в ПУТ. Полагаю, это из-за того, что Вы с ним работаете сейчас?
+
+Могли бы вы отпустить ПУТ ненадолго?
+
+
+
+С уважением, Острик Петр
+
+
+"""
+#%%
+llm = init_chat_model("gpt-4.1-mini", model_provider="openai")
+#%%
+class MailTopic(BaseModel):
+    topic_name: str = Field(..., description="тема содержания mail")
+    topic_description: str = Field(..., description=" краткое описание темы mail")
+    topic_value: int = Field(..., description="важность письмо по шкале от 0 до 10")
+
+
+class MailSearch(BaseModel):
+   cc_persons: List[str] = Field(None, description="список всех mail адресов в копии письма")
+   companies: List[str] = Field(None, description="корпоративные префиксы mail адресов участников в копии письма")
+   mail_topics: List[MailTopic] = Field(..., description="различные темы содержания email")
+
+parser = PydanticOutputParser(pydantic_object=MailSearch)
+
+chain = llm | parser
+
+
+#%%
+output_search_answer = chain.invoke(mail_raw + str(parser.get_format_instructions()))
+#%%
+output_search_answer.model_dump_json()
+#%%
+видео по декораторам, по ООП
+#%%
+llm.invoke(mail_raw)
+#%%
+
+
+pre_proccess_mail_db.ipynb
+
+#%%
+import pandas as pd
+import clickhouse_connect
+from datetime import datetime
+
+
+
+
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+#%%
+
+# создаём клиент
+# client = clickhouse_connect.get_client(
+#     host= os.getenv("CLICKHOUSE_HOST") ,   # замени на свой хост/адрес
+#     port= os.getenv("CLICKHOUSE_PORT"),
+#     username=  os.getenv("CLICKHOUSE_USER"),
+#     password= os.getenv("CLICKHOUSE_PASSWORD")
+# )
+client = clickhouse_connect.get_client(
+    host="84.201.160.255",   # замени на свой хост/адрес
+    port=8123,
+    username="peter",
+    password="1234"
+)
+#%%
+
+#%%
+# SQL-запрос
+query = "SELECT * FROM mailkb.emails ORDER BY id DESC LIMIT 5"
+
+# вернуть сразу DataFrame
+df = client.query_df(query)
+
+#%%
+df = df.iloc[2]['body_text']
+#%%
+## импортируем либы для структурированного ответа
+
+from pydantic import BaseModel, Field
+from langchain.agents import create_agent
+from typing import List
+
+
+
+class MailInfo(BaseModel):
+    """Contact information for a person."""
+    topic: str = Field(..., description="The name of the mail ")
+    email: str = Field(..., description="The email address of the persons of the mail")
+
+class MailChainInfo(BaseModel):
+    emails: List[MailInfo] = Field(description='mail chain info')
+
+agent = create_agent(
+    model="gpt-5",
+    response_format=MailChainInfo  # Auto-selects ProviderStrategy
+)
+
+# result = agent.invoke({
+#     "messages": [{"role": "user", "content": "Extract contact info from: {}"}]
+# })
+#
+# print(result["structured_response"])
+# ContactInfo(name='John Doe', email='john@example.com', phone='(555) 123-4567')
+#%%
+df['body_text'][0]
+#%%
+result = agent.invoke({
+    "messages": [
+        {
+            "role": "user",
+            "content": f"""Начни обработку строки и вытащи темы писем и email адреса:
+
+{df['body_text'][0]}   """
+
+        }
+    ]
+})
+
+report = result["messages"][-1].content
+print(report)
+
+
+#%%
+Structured output
+
+
+ключевые поинты
+emailы все
+#%% md
+### Агент по очистке письма в диалогах
+#%%
+from pydantic import BaseModel, Field
+from langchain.agents import create_agent
+from clickhouse_connect import get_client
+import hashlib
+import time
+#%%
+# --- structured output schema ---
+
+class CleanBody(BaseModel):
+    """Cleaned body of an email."""
+
+    body_clean: str = Field(
+        ...,
+        description="Top-level email text without quoted history, headers, or signatures"
+    )
+
+# --- prompt for the LLM ---
+
+PROMPT = """
+You clean email bodies.
+
+Task:
+Extract ONLY the new message written by the sender.
+
+Remove:
+- quoted history
+- repeated headers (From, Sent, Subject)
+- signatures
+- reply separators
+
+Keep only the actual message content.
+
+Return JSON matching the schema.
+"""
+
+# --- create LLM agent ---
+
+agent = create_agent(
+    model="deepseek-chat",
+    response_format=CleanBody
+)
+
+#%%
+# ---------- helper ----------
+
+def body_md5(text):
+
+    text = text.strip()
+
+    return hashlib.md5(text.encode()).hexdigest()
+
+
+def clean_email_body(text: str):
+
+    result = agent.invoke({
+        "messages": [
+            {"role": "system", "content": PROMPT},
+            {"role": "user", "content": text}
+        ]
+    })
+
+    return result["structured_response"].body_clean
+
+#%%
+# ---------- загрузим кэш md5 в память ----------
+
+print("Loading cache...")
+
+cached_md5 = set(
+    r[0] for r in client.query("""
+        SELECT raw_md5
+        FROM mailkb.llm_body_clean_cache
+    """).result_rows
+)
+
+print("Cached bodies:", len(cached_md5))
+#%%
+# body = df["body_text"][0]
+body = df
+cleaned = clean_email_body(body)
+
+
+
+#%%
+cleaned
+#%%
+# ---------- batch параметры ----------
+
+BATCH = 2
+#%%
+# ---------- основной цикл ----------
+
+while True:
+
+    rows = client.query("""
+        SELECT
+            id,
+            body_text
+        FROM mailkb.emails
+        WHERE body_text IS NOT NULL
+          AND body_text != ''
+        LIMIT %(limit)s
+    """, {"limit": BATCH}).result_rows
+
+    if not rows:
+        print("No rows found")
+        break
+
+    insert_batch = []
+
+    for email_id, body in rows:
+
+        md5 = body_md5(body)
+
+        # если уже обработано — пропускаем
+        if md5 in cached_md5:
+            continue
+
+        start = time.time()
+
+        try:
+
+            cleaned = clean_email_body(body)
+
+            latency = int((time.time() - start) * 1000)
+
+            insert_batch.append({
+                "raw_md5": md5,
+                "parser_version": "v1",
+                "model_name": "deepseek-chat",
+                "status": "success",
+                "body_clean": cleaned,
+                "error": "",
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "latency_ms": latency
+            })
+
+            cached_md5.add(md5)
+
+        except Exception as e:
+
+            insert_batch.append({
+                "raw_md5": md5,
+                "parser_version": "v1",
+                "model_name": "deepseek-chat",
+                "status": "failed",
+                "body_clean": "",
+                "error": str(e),
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "latency_ms": 0
+            })
+
+        print("Processing:", email_id)
+
+if insert_batch:
+
+    data = [
+        [
+            row["raw_md5"],
+            row["parser_version"],
+            row["model_name"],
+            row["status"],
+            row["body_clean"],
+            row["error"],
+            row["tokens_in"],
+            row["tokens_out"],
+            row["latency_ms"]
+        ]
+        for row in insert_batch
+    ]
+
+    client.insert(
+        "mailkb.llm_body_clean_cache",
+        data,
+        column_names=[
+            "raw_md5",
+            "parser_version",
+            "model_name",
+            "status",
+            "body_clean",
+            "error",
+            "tokens_in",
+            "tokens_out",
+            "latency_ms"
+        ]
+    )
+
+    print("Inserted:", len(data))
+
+#%%
+
+#%% md
+### batch model agent
+чистим батчами
+
+#%%
+import hashlib
+import time
+from clickhouse_connect import get_client
+from langchain.agents import create_agent
+from pydantic import BaseModel, Field
+from typing import List
+
+
+# ---------- LLM schema (batch) ----------
+
+class CleanItem(BaseModel):
+    raw_md5: str = Field(description="MD5 of the original raw body (as provided in the input batch)")
+    body_clean: str = Field(description="Cleaned top-level email text without quoted history, headers or signatures")
+
+class CleanBatch(BaseModel):
+    items: List[CleanItem]
+#%%
+# ---------- LLM agent ----------
+
+agent = create_agent(
+    model="deepseek-chat",
+    response_format=CleanBatch
+)
+
+PROMPT = """
+You clean email bodies.
+
+Task:
+For each email body, extract ONLY the new message written by the sender.
+
+Remove:
+- quoted history (previous replies/forwards)
+- repeated headers like From/Sent/Subject
+- signatures, phone blocks, company footers
+
+Return JSON matching the schema.
+
+Important:
+- DO NOT invent content.
+- Return one item per input email with the same raw_md5.
+"""
+
+
+# ---------- ClickHouse ----------
+
+client = clickhouse_connect.get_client(
+    host="84.201.160.255",   # замени на свой хост/адрес
+    port=8123,
+    username="peter",
+    password="1234"
+)
+
+# ---------- helpers ----------
+
+def body_md5(text: str) -> str:
+    text = (text or "").strip()
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def clean_email_bodies_batch(md5_and_text: List[tuple[str, str]]) -> dict[str, str]:
+    """
+    md5_and_text: list of (raw_md5, body_text)
+    returns: dict raw_md5 -> body_clean
+    """
+
+    # Собираем вход в понятном для модели виде
+    # (важно: включаем raw_md5, чтобы можно было сопоставить ответы)
+    blocks = []
+    for md5, body in md5_and_text:
+        blocks.append(f"raw_md5: {md5}\nbody:\n{body}")
+
+    user_content = "\n\n---\n\n".join(blocks)
+
+    result = agent.invoke({
+        "messages": [
+            {"role": "system", "content": PROMPT},
+            {"role": "user", "content": user_content}
+        ]
+    })
+
+    batch_obj: CleanBatch = result["structured_response"]
+
+    # Превращаем в dict для удобства
+    out = {}
+    for item in batch_obj.items:
+        out[item.raw_md5] = item.body_clean
+
+    return out
+
+#%%
+# ---------- load cache md5 to memory ----------
+
+print("Loading cache...")
+cached_md5 = set(r[0] for r in client.query("""
+    SELECT raw_md5 FROM mailkb.llm_body_clean_cache
+""").result_rows)
+print("Cached:", len(cached_md5))
+#%%
+# ---------- parameters ----------
+
+FETCH_BATCH = 30      # сколько строк читать из emails за раз
+LLM_BATCH = 5         # сколько писем отправлять в один LLM запрос (начни с 5-10)
+PARSER_VERSION = "v1"
+MODEL_NAME = "deepseek-chat"
+
+#%%
+# ---------- main loop ----------
+
+while True:
+    # Для простоты: берём "какие-то" письма (как в твоём шаге 5),
+    # но обязательно добавь ORDER BY rand() на тесте, чтобы не крутиться на одном и том же.
+    rows = client.query("""
+        SELECT id, body_text
+        FROM mailkb.emails
+        WHERE body_text IS NOT NULL AND body_text != ''
+        ORDER BY rand()
+        LIMIT %(limit)s
+    """, {"limit": FETCH_BATCH}).result_rows
+
+    if not rows:
+        print("No rows found, stop.")
+        break
+
+    # Отфильтруем уже обработанные по md5
+    to_process = []
+    for email_id, body in rows:
+        md5 = body_md5(body)
+        if md5 in cached_md5:
+            continue
+        to_process.append((md5, body))
+
+    if not to_process:
+        print("All fetched rows already cached; fetching next...")
+        continue
+
+    # Разбиваем на пачки для LLM
+    for i in range(0, len(to_process), LLM_BATCH):
+        chunk = to_process[i:i+LLM_BATCH]
+
+        start = time.time()
+
+        try:
+            cleaned_map = clean_email_bodies_batch(chunk)
+            latency_ms = int((time.time() - start) * 1000)
+
+            # Подготовим данные для вставки в CH: list of lists + column_names
+            data = []
+            for raw_md5, _body in chunk:
+                body_clean = cleaned_map.get(raw_md5, "")
+                status = "success" if body_clean.strip() else "failed"
+                error = "" if status == "success" else "empty_clean_result"
+
+                data.append([
+                    raw_md5,
+                    PARSER_VERSION,
+                    MODEL_NAME,
+                    status,
+                    body_clean,
+                    error,
+                    0,   # tokens_in (пока 0, потом можно заполнить, если у клиента есть usage)
+                    0,   # tokens_out
+                    latency_ms
+                ])
+
+                cached_md5.add(raw_md5)
+
+            client.insert(
+                "mailkb.llm_body_clean_cache",
+                data,
+                column_names=[
+                    "raw_md5",
+                    "parser_version",
+                    "model_name",
+                    "status",
+                    "body_clean",
+                    "error",
+                    "tokens_in",
+                    "tokens_out",
+                    "latency_ms"
+                ]
+            )
+
+            print(f"Inserted batch: {len(data)} (latency_ms={latency_ms})")
+
+        except Exception as e:
+            # Если пачка упала — не теряем всё: можно записать failed для всех md5 в chunk
+            err = str(e)
+            data = []
+            for raw_md5, _body in chunk:
+                data.append([
+                    raw_md5,
+                    PARSER_VERSION,
+                    MODEL_NAME,
+                    "failed",
+                    "",
+                    err,
+                    0,
+                    0,
+                    0
+                ])
+                cached_md5.add(raw_md5)
+
+            client.insert(
+                "mailkb.llm_body_clean_cache",
+                data,
+                column_names=[
+                    "raw_md5",
+                    "parser_version",
+                    "model_name",
+                    "status",
+                    "body_clean",
+                    "error",
+                    "tokens_in",
+                    "tokens_out",
+                    "latency_ms"
+                ]
+            )
+
+            print(f"Batch failed, inserted failed rows: {len(data)}; error={err}")
+#%%
+
+#%% md
+### вложенный класс
+
+#%%
+
+#%%
+
+#%%
+import pandas as pd
+import clickhouse_connect
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+#%%
+
+# создаём клиент
+# client = clickhouse_connect.get_client(
+#     host= os.getenv("CLICKHOUSE_HOST") ,   # замени на свой хост/адрес
+#     port= os.getenv("CLICKHOUSE_PORT"),
+#     username=  os.getenv("CLICKHOUSE_USER"),
+#     password= os.getenv("CLICKHOUSE_PASSWORD")
+# )
+client = clickhouse_connect.get_client(
+    host="84.201.160.255",   # замени на свой хост/адрес
+    port=8123,
+    username="peter",
+    password="1234"
+)
+#%%
+
+#%%
+# SQL-запрос
+query = "SELECT * FROM mailkb.emails ORDER BY id DESC LIMIT 5"
+
+# вернуть сразу DataFrame
+df = client.query_df(query)
+
+#%%
+# df = df.iloc[2]['body_text']
+#%%
+df
+#%% md
+#### вариант 1
+#%%
+## импортируем либы для структурированного ответа
+
+from pydantic import BaseModel, Field
+from langchain.agents import create_agent
+from typing import List
+
+
+
+class MailInfo(BaseModel):
+    """Contact information for a person."""
+    topic: str = Field(..., description="The name of the mail ")
+    email_body: str = Field(..., description="The email clean body text")
+    date: str = Field(..., description="The date and time the message was sent. Format: YYYY-MM-DD")
+    mail_query_number: int = Field(..., description="The mail query in topic number")
+    key_words
+
+class MailChainInfo(BaseModel):
+    emails: List[MailInfo] = Field(description='mail chain info')
+    #темы
+
+agent = create_agent(
+    model="",
+    response_format=MailChainInfo  # Auto-selects ProviderStrategy
+)
+
+# result = agent.invoke({
+#     "messages": [{"role": "user", "content": "Extract contact info from: {}"}]
+# })
+#
+# print(result["structured_response"])
+# ContactInfo(name='John Doe', email='john@example.com', phone='(555) 123-4567')
+#%%
+df['body_text'][0]
+#%%
+result = agent.invoke({
+    "messages": [
+        {
+            "role": "user",
+            "content": f"""Начни обработку строки и вытащи темы писем и email адреса:
+
+{df['body_text'][0]}   """
+
+        }
+    ]
+})
+
+report = result["messages"][-1].content
+print(report)
+
+
+#%% md
+#### вариант 2 (12.03.26 -работает)
+#%%
+
+from pydantic import BaseModel, Field
+from typing import List
+from langchain.agents import create_agent
+
+
+class MailInfo(BaseModel):
+    topic: str = Field(description="Topic of the email")
+    email_body: str = Field(description="Clean email body")
+    date: str = Field(description="Date of the email YYYY-MM-DD")
+    mail_query_number: int = Field(description="Order number of the email in the chain")
+    key_words: List[str] = Field(description="Important keywords")
+
+
+class MailChainInfo(BaseModel):
+    emails: List[MailInfo] = Field(description="Mail chain info")
+#%%
+
+agent = create_agent(
+    model="deepseek-chat",
+    tools=[],  # явно без инструментов
+    response_format=MailChainInfo
+)
+#%%
+query = """
+SELECT
+    id,
+    sent_at_utc,
+    body_text
+FROM mailkb.emails_unique
+
+LEFT ANTI JOIN mailkb.mail_parsed
+ON emails_unique.id = mail_parsed.email_id
+
+WHERE
+    body_text IS NOT NULL
+    AND length(body_text) > 30
+
+ORDER BY sent_at_utc DESC
+LIMIT 10
+"""
+
+df = client.query_df(query)
+#%%
+df
+#%%
+results = []
+
+for i in range(len(df)):
+    body = df["body_text"][i]
+
+    result = agent.invoke({
+        "messages": [
+            {
+                "role": "user",
+                "content": f"""
+Начни обработку письма.
+
+Извлеки структуру переписки.
+
+EMAIL BODY:
+{body}
+"""
+            }
+        ]
+    })
+
+    structured = result["structured_response"]
+    parsed_json = structured.model_dump_json()
+
+    results.append({
+        "email_id": df["id"][i],
+        "parsed_json": parsed_json
+    })
+
+#%%
+results
+#%%
+
+rows = [
+    [r["email_id"], r["parsed_json"]]
+    for r in results
+]
+
+client.insert(
+    "mailkb.mail_parsed",
+    rows,
+    column_names=["email_id", "parsed_json"]
+)
+#%%
+
+#%% md
+#### вариант 3 с параллельной обработкой
+#%%
+from pydantic import BaseModel, Field
+from typing import List
+from langchain.agents import create_agent
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+
+
+class MailInfo(BaseModel):
+    topic: str = Field(description="Topic of the email")
+    email_body: str = Field(description="Clean email body")
+    date: str = Field(description="Date of the email YYYY-MM-DD")
+    mail_query_number: int = Field(description="Order number of the email in the chain")
+    key_words: List[str] = Field(description="Important keywords")
+
+
+class ParsedEmailResult(BaseModel):
+    email_id: str = Field(description="Original email id from the input batch")
+    emails: List[MailInfo] = Field(description="Parsed content for this email")
+
+
+class ParsedEmailBatch(BaseModel):
+    items: List[ParsedEmailResult] = Field(description="Parsed results for all emails in the batch")
+
+
+agent = create_agent(
+    model="deepseek-chat",
+    tools=[],
+    response_format=ParsedEmailBatch
+)
+
+
+query = """
+SELECT
+    id,
+    sent_at_utc,
+    body_text
+FROM mailkb.emails_unique
+
+LEFT ANTI JOIN mailkb.mail_parsed
+ON emails_unique.id = mail_parsed.email_id
+
+WHERE
+    body_text IS NOT NULL
+    AND length(body_text) > 30
+
+ORDER BY sent_at_utc DESC
+LIMIT 30
+"""
+
+#%%
+
+df = client.query_df(query)
+
+
+def chunk_list(rows, batch_size):
+    for i in range(0, len(rows), batch_size):
+        yield rows[i:i + batch_size]
+
+
+def build_batch_prompt(batch_rows):
+    parts = []
+    for idx, row in enumerate(batch_rows, start=1):
+        body = (row["body_text"] or "")[:15000]
+        parts.append(
+            f"""
+EMAIL #{idx}
+email_id: {row["id"]}
+
+EMAIL BODY:
+{body}
+""".strip()
+        )
+
+    return """
+Начни обработку нескольких писем.
+
+Для КАЖДОГО письма:
+- извлеки структуру переписки,
+- верни отдельный результат,
+- обязательно сохрани правильный email_id,
+- не смешивай письма между собой.
+
+Верни результат для всех писем из входного батча.
+
+{}
+""".format("\n\n" + ("\n\n" + "=" * 80 + "\n\n").join(parts))
+
+
+def process_batch(batch_rows):
+    try:
+        prompt = build_batch_prompt(batch_rows)
+
+        result = agent.invoke({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        })
+
+        structured = result["structured_response"]
+
+        parsed_rows = []
+        returned_ids = set()
+
+        for item in structured.items:
+            returned_ids.add(item.email_id)
+            parsed_rows.append({
+                "email_id": item.email_id,
+                "parsed_json": item.model_dump_json()
+            })
+
+        # если модель не вернула часть писем — помечаем ошибкой
+        requested_ids = {row["id"] for row in batch_rows}
+        missing_ids = requested_ids - returned_ids
+
+        error_rows = [
+            {"email_id": mid, "error": "missing_in_model_response"}
+            for mid in missing_ids
+        ]
+
+        return parsed_rows, error_rows
+
+    except Exception as e:
+        return [], [
+            {"email_id": row["id"], "error": str(e)}
+            for row in batch_rows
+        ]
+
+
+#%%
+
+BATCH_SIZE = 3
+MAX_WORKERS = 6
+
+rows = df.to_dict("records")
+batches = list(chunk_list(rows, BATCH_SIZE))
+
+all_success = []
+all_errors = []
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = [executor.submit(process_batch, batch) for batch in batches]
+
+    for future in as_completed(futures):
+        success_rows, error_rows = future.result()
+        all_success.extend(success_rows)
+        all_errors.extend(error_rows)
+
+print("success:", len(all_success))
+print("errors:", len(all_errors))
+
+#%%
+
+# успешные результаты — в ClickHouse
+if all_success:
+    insert_rows = [[r["email_id"], r["parsed_json"]] for r in all_success]
+    client.insert(
+        "mailkb.mail_parsed",
+        insert_rows,
+        column_names=["email_id", "parsed_json"]
+    )
+
+errors_df = pd.DataFrame(all_errors)
+#%%
+errors_df
+#%% md
+#### вариант 4 параллельная обработка без агента
+#%%
+from pydantic import BaseModel, Field
+from typing import List
+
+
+class MailInfo(BaseModel):
+    topic: str
+    email_body: str
+    date: str
+    mail_query_number: int
+    key_words: List[str]
+
+
+class ParsedEmailResult(BaseModel):
+    email_id: str
+    emails: List[MailInfo]
+
+
+class ParsedEmailBatch(BaseModel):
+    items: List[ParsedEmailResult]
+#%%
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model(
+    model="deepseek-chat",
+    temperature=0
+)
+
+structured_llm = llm.with_structured_output(ParsedEmailBatch)
+#%%
+def build_batch_prompt(batch_rows):
+    parts = []
+
+    for idx, row in enumerate(batch_rows, start=1):
+        body = (row["body_text"] or "")[:15000]
+
+        parts.append(
+            f"""
+EMAIL #{idx}
+email_id: {row["id"]}
+
+EMAIL BODY:
+{body}
+""".strip()
+        )
+
+    return f"""
+Начни обработку нескольких писем.
+
+Для КАЖДОГО письма:
+- извлеки структуру переписки
+- верни результат отдельно
+- ОБЯЗАТЕЛЬНО укажи email_id
+- не смешивай письма между собой
+
+Верни результат в формате ParsedEmailBatch.
+
+{chr(10).join(parts)}
+"""
+#%%
+import time
+
+
+def call_with_retry(prompt, max_retries=3):
+
+    for attempt in range(max_retries):
+        try:
+            return structured_llm.invoke(prompt)
+
+        except Exception as e:
+            print(f"Retry {attempt+1} due to error:", e)
+            time.sleep(1.5 * (attempt + 1))
+
+    raise Exception("LLM failed after retries")
+#%%
+def process_batch(batch_rows):
+
+    prompt = build_batch_prompt(batch_rows)
+
+    try:
+        structured = call_with_retry(prompt)
+
+        parsed_rows = []
+        returned_ids = set()
+
+        for item in structured.items:
+            returned_ids.add(item.email_id)
+
+            parsed_rows.append({
+                "email_id": item.email_id,
+                "parsed_json": item.model_dump_json()
+            })
+
+        requested_ids = {row["id"] for row in batch_rows}
+        missing_ids = requested_ids - returned_ids
+
+        error_rows = [
+            {"email_id": mid, "error": "missing_in_response"}
+            for mid in missing_ids
+        ]
+
+        return parsed_rows, error_rows
+
+    except Exception as e:
+        return [], [
+            {"email_id": row["id"], "error": str(e)}
+            for row in batch_rows
+        ]
+#%%
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def chunk_list(rows, batch_size):
+    for i in range(0, len(rows), batch_size):
+        yield rows[i:i + batch_size]
+
+
+query = """
+SELECT
+    id,
+    sent_at_utc,
+    body_text
+FROM mailkb.emails_unique
+
+LEFT ANTI JOIN mailkb.mail_parsed
+ON emails_unique.id = mail_parsed.email_id
+
+WHERE
+    body_text IS NOT NULL
+    AND length(body_text) > 30
+
+ORDER BY sent_at_utc DESC
+LIMIT 50
+"""
+
+df = client.query_df(query)
+
+rows = df.to_dict("records")
+
+BATCH_SIZE = 3
+MAX_WORKERS = 6
+
+batches = list(chunk_list(rows, BATCH_SIZE))
+
+all_success = []
+all_errors = []
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+
+    futures = [executor.submit(process_batch, b) for b in batches]
+
+    for future in as_completed(futures):
+        success_rows, error_rows = future.result()
+
+        all_success.extend(success_rows)
+        all_errors.extend(error_rows)
+
+print("SUCCESS:", len(all_success))
+print("ERRORS:", len(all_errors))
+#%%
+if all_success:
+    insert_rows = [
+        [r["email_id"], r["parsed_json"]]
+        for r in all_success
+    ]
+
+    client.insert(
+        "mailkb.mail_parsed",
+        insert_rows,
+        column_names=["email_id", "parsed_json"]
+    )
+#%%
+import pandas as pd
+
+errors_df = pd.DataFrame(all_errors)
+# errors_df.to_csv("mail_errors.csv", index=False)
+
+
+рабочий ноутбук
+
+#%%
+
+#%% md
+### делаем 2 коллекции
+#%%
+from platform import python_version
+import os
+import re
+import uuid
+import json
+from collections import defaultdict
+
+import pandas as pd
+from dotenv import load_dotenv
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance
+from langchain_qdrant import QdrantVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+import clickhouse_connect
+
+load_dotenv()
+
+
+#%%
+# ---------------------------------------------------
+# 1. Подключения
+# ---------------------------------------------------
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+client_qdrant = QdrantClient(url=QDRANT_URL)
+
+CH_HOST = os.getenv("CH_HOST", "84.201.160.255")
+CH_PORT = int(os.getenv("CH_PORT", "8123"))
+CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "peter")
+CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "1234")
+
+client_clickhouse = clickhouse_connect.get_client(
+    host=CH_HOST,
+    port=CH_PORT,
+    username=CLICKHOUSE_USER,
+    password=CLICKHOUSE_PASSWORD
+)
+
+BASE_URL = os.getenv("EMBEDDINGS_BASE_URL", "http://localhost:8000/v1")
+
+embeddings = OpenAIEmbeddings(
+    model="Qwen/Qwen3-Embedding-0.6B",
+    api_key="not-needed",
+    base_url=BASE_URL,
+    tiktoken_enabled=False,
+)
+
+vec = embeddings.embed_query("test")
+EMBEDDING_DIM = len(vec)
+
+print("Python:", python_version())
+print("Embedding dim:", EMBEDDING_DIM)
+
+
+#%%
+# ---------------------------------------------------
+# 2. Имена коллекций
+# ---------------------------------------------------
+
+MESSAGES_COLLECTION = "mailkb_messages"
+THREADS_COLLECTION = "mailkb_threads"
+
+
+# ---------------------------------------------------
+# 3. Настройка коллекций
+# ---------------------------------------------------
+
+def ensure_collection(collection_name: str, recreate: bool = False) -> QdrantVectorStore:
+    collections = client_qdrant.get_collections().collections
+    existing_names = {c.name for c in collections}
+
+    if recreate and collection_name in existing_names:
+        client_qdrant.delete_collection(collection_name=collection_name)
+        existing_names.remove(collection_name)
+
+    if collection_name not in existing_names:
+        client_qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(
+                size=EMBEDDING_DIM,
+                distance=Distance.COSINE,
+            ),
+        )
+
+    return QdrantVectorStore(
+        client=client_qdrant,
+        collection_name=collection_name,
+        embedding=embeddings,
+    )
+
+
+# recreate=True только если хочешь пересобрать с нуля
+messages_qv = ensure_collection(MESSAGES_COLLECTION, recreate=False)
+threads_qv = ensure_collection(THREADS_COLLECTION, recreate=False)
+
+
+#%%
+# ---------------------------------------------------
+# 4. Утилиты
+# ---------------------------------------------------
+
+RE_PREFIX = re.compile(r'^\s*(re|fw|fwd|aw|ответ):\s*', flags=re.IGNORECASE)
+
+def normalize_subject(subj: str) -> str:
+    s = (subj or "").strip()
+    while True:
+        ns = RE_PREFIX.sub('', s).strip()
+        if ns == s:
+            break
+        s = ns
+    s = re.sub(r'\s+', ' ', s)
+    return s.lower()
+
+def split_addrs(x) -> list[str]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return [str(v).strip() for v in x if str(v).strip()]
+    return [p.strip() for p in re.split(r'[;,]', str(x)) if p.strip()]
+
+def participants_list(row) -> list[str]:
+    people = (
+        split_addrs(row.get("from_addr")) +
+        split_addrs(row.get("to_addr")) +
+        split_addrs(row.get("cc_addr")) +
+        split_addrs(row.get("bcc_addr"))
+    )
+    return sorted(set(people))
+
+def safe_json_loads(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    return None
+
+# ---------------------------------------------------
+# 5. SQL: распарсенные письма из emails_unique
+# ---------------------------------------------------
+
+def load_join_batch(limit: int, offset: int) -> pd.DataFrame:
+    query = f"""
+    SELECT
+        e.id,
+        e.thread_key,
+        e.message_id,
+        e.subject,
+        e.from_addr,
+        e.to_addr,
+        e.cc_addr,
+        e.bcc_addr,
+        e.sent_at_utc,
+        e.folder,
+        p.parsed_json
+    FROM mailkb.emails_unique e
+    INNER JOIN mailkb.mail_parsed p
+        ON e.id = p.email_id
+    ORDER BY e.sent_at_utc ASC, e.id ASC
+    LIMIT {limit} OFFSET {offset}
+    """
+    return client_clickhouse.query_df(query)
+
+def load_all_joined_df() -> pd.DataFrame:
+    query = """
+    SELECT
+        e.id,
+        e.thread_key,
+        e.message_id,
+        e.subject,
+        e.from_addr,
+        e.to_addr,
+        e.cc_addr,
+        e.bcc_addr,
+        e.sent_at_utc,
+        e.folder,
+        p.parsed_json
+    FROM mailkb.emails_unique e
+    INNER JOIN mailkb.mail_parsed p
+        ON e.id = p.email_id
+    ORDER BY e.sent_at_utc ASC, e.id ASC
+    """
+    return client_clickhouse.query_df(query)
+
+#%%
+# ---------------------------------------------------
+# 4. Утилиты
+# ---------------------------------------------------
+
+RE_PREFIX = re.compile(r'^\s*(re|fw|fwd|aw|ответ):\s*', flags=re.IGNORECASE)
+
+def normalize_subject(subj: str) -> str:
+    s = (subj or "").strip()
+    while True:
+        ns = RE_PREFIX.sub('', s).strip()
+        if ns == s:
+            break
+        s = ns
+    s = re.sub(r'\s+', ' ', s)
+    return s.lower()
+
+def split_addrs(x) -> list[str]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return [str(v).strip() for v in x if str(v).strip()]
+    return [p.strip() for p in re.split(r'[;,]', str(x)) if p.strip()]
+
+def participants_list(row) -> list[str]:
+    people = (
+        split_addrs(row.get("from_addr")) +
+        split_addrs(row.get("to_addr")) +
+        split_addrs(row.get("cc_addr")) +
+        split_addrs(row.get("bcc_addr"))
+    )
+    return sorted(set(people))
+
+def safe_json_loads(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    return None
+
+# ---------------------------------------------------
+# 5. SQL: распарсенные письма из emails_unique
+# ---------------------------------------------------
+
+def load_join_batch(limit: int, offset: int) -> pd.DataFrame:
+    query = f"""
+    SELECT
+        e.id,
+        e.thread_key,
+        e.message_id,
+        e.subject,
+        e.from_addr,
+        e.to_addr,
+        e.cc_addr,
+        e.bcc_addr,
+        e.sent_at_utc,
+        e.folder,
+        p.parsed_json
+    FROM mailkb.emails_unique e
+    INNER JOIN mailkb.mail_parsed p
+        ON e.id = p.email_id
+    ORDER BY e.sent_at_utc ASC, e.id ASC
+    LIMIT {limit} OFFSET {offset}
+    """
+    return client_clickhouse.query_df(query)
+
+def load_all_joined_df() -> pd.DataFrame:
+    query = """
+    SELECT
+        e.id,
+        e.thread_key,
+        e.message_id,
+        e.subject,
+        e.from_addr,
+        e.to_addr,
+        e.cc_addr,
+        e.bcc_addr,
+        e.sent_at_utc,
+        e.folder,
+        p.parsed_json
+    FROM mailkb.emails_unique e
+    INNER JOIN mailkb.mail_parsed p
+        ON e.id = p.email_id
+    ORDER BY e.sent_at_utc ASC, e.id ASC
+    """
+    return client_clickhouse.query_df(query)
+
+#%%
+# ---------------------------------------------------
+# 6. Построение документов для messages
+# ---------------------------------------------------
+
+def build_message_docs(df: pd.DataFrame) -> list[Document]:
+    docs: list[Document] = []
+
+    for row in df.to_dict("records"):
+        parsed = safe_json_loads(row.get("parsed_json"))
+        if not parsed:
+            continue
+
+        parsed_emails = parsed.get("emails", [])
+        if not isinstance(parsed_emails, list):
+            continue
+
+        subj = (row.get("subject") or "").strip()
+        participants = participants_list(row)
+
+        for msg in parsed_emails:
+            if not isinstance(msg, dict):
+                continue
+
+            email_body = (msg.get("email_body") or "").strip()
+            if not email_body:
+                continue
+
+            topic = (msg.get("topic") or subj or "").strip()
+            msg_date = msg.get("date")
+            mail_query_number = msg.get("mail_query_number")
+            keywords = msg.get("key_words") or []
+            thread_key = row.get("thread_key") or normalize_subject(subj)
+
+            meta = {
+                "email_id": row.get("id"),
+                "message_id": row.get("message_id"),
+                "subject": subj,
+                "topic": topic,
+                "date": str(msg_date) if msg_date is not None else str(row.get("sent_at_utc")),
+                "mail_query_number": int(mail_query_number) if str(mail_query_number).isdigit() else mail_query_number,
+                "keywords": keywords,
+                "sent_at_utc": str(row.get("sent_at_utc")),
+                "folder": row.get("folder"),
+                "participants": participants,
+                "thread_key": thread_key,
+                "source_type": "message",
+            }
+
+            docs.append(Document(page_content=email_body, metadata=meta))
+
+    return docs
+
+def make_message_ids(docs: list[Document]) -> list[str]:
+    ids = []
+    for d in docs:
+        raw = (
+            f"{d.metadata.get('email_id')}::"
+            f"{d.metadata.get('mail_query_number')}::"
+            f"{d.metadata.get('date')}::"
+            f"{d.page_content[:100]}"
+        )
+        uid = uuid.uuid5(uuid.NAMESPACE_URL, raw)
+        ids.append(str(uid))
+    return ids
+
+def upload_message_docs(docs: list[Document], qv: QdrantVectorStore):
+    if not docs:
+        return 0
+
+    ids = make_message_ids(docs)
+    texts = [d.page_content for d in docs]
+    metadatas = [d.metadata for d in docs]
+
+    qv.add_texts(
+        texts=texts,
+        metadatas=metadatas,
+        ids=ids
+    )
+    return len(docs)
+
+def ingest_messages(batch_size: int = 1000):
+    offset = 0
+    total_docs = 0
+    total_rows = 0
+
+    while True:
+        df_batch = load_join_batch(limit=batch_size, offset=offset)
+        if df_batch.empty:
+            break
+
+        docs = build_message_docs(df_batch)
+        inserted = upload_message_docs(docs, messages_qv)
+
+        total_docs += inserted
+        total_rows += len(df_batch)
+
+        print(
+            f"[messages] rows_processed={total_rows}, "
+            f"docs_inserted_total={total_docs}, "
+            f"last_batch_rows={len(df_batch)}, "
+            f"last_batch_docs={inserted}"
+        )
+
+        offset += len(df_batch)
+
+    print(f"[messages] DONE: rows_processed={total_rows}, docs_inserted_total={total_docs}")
+#%%
+# ---------------------------------------------------
+# 8. Запуск
+# ---------------------------------------------------
+
+# если нужно пересобрать коллекции с нуля, поставь recreate=True выше
+ingest_messages(batch_size=1000)
+# ingest_threads()
+#%%
+df_test = load_all_joined_df()
+print(df_test.columns.tolist())
+print(df_test[["id", "thread_key", "subject"]].head())
+#%% md
+### агент
+#%%
+import json
+from collections import defaultdict
+from langchain.tools import tool
+from collections import defaultdict
+from pathlib import Path
+
+from langchain.tools import tool
+
+SUMMARY_DIR = Path("../../summaries")
+SUMMARY_DIR.mkdir(exist_ok=True)
+#%% md
+
+#%%
+@tool
+def search_project_threads(project_hint: str, limit: int = 30) -> str:
+    """
+    Найти релевантные обсуждения проекта в коллекции mailkb_threads.
+    """
+    docs = threads_qv.similarity_search(project_hint, k=limit)
+
+    results = []
+    seen = set()
+
+    for doc in docs:
+        md = doc.metadata or {}
+        thread_key = md.get("thread_key")
+
+        if not thread_key or thread_key in seen:
+            continue
+        seen.add(thread_key)
+
+        results.append({
+            "thread_key": thread_key,
+            "subject": md.get("subject"),
+            "participants": md.get("participants") or [],
+            "keywords": md.get("keywords") or [],
+            "message_count": md.get("message_count"),
+            "first_date": md.get("first_date"),
+            "last_date": md.get("last_date"),
+            "snippet": (doc.page_content[:800] + "…") if doc.page_content else None,
+        })
+
+    return json.dumps(
+        {"project_hint": project_hint, "threads": results},
+        ensure_ascii=False,
+        indent=2
+    )
+
+
+def _escape_ch_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+@tool
+def get_project_corpus_batch(
+        project_hint: str,
+        offset: int = 0,
+        batch_size: int = 50,
+        thread_limit: int = 30
+) -> str:
+    """
+    Собрать батч корпуса проекта:
+    1) найти релевантные thread_key в mailkb_threads
+    2) достать все сообщения по этим thread_key
+    3) дедуплицировать и отсортировать
+    4) вернуть батч по offset/batch_size
+    """
+    thread_docs = threads_qv.similarity_search(project_hint, k=thread_limit)
+
+    thread_keys = []
+    seen = set()
+
+    for doc in thread_docs:
+        md = doc.metadata or {}
+        tk = md.get("thread_key")
+        if tk and tk not in seen:
+            seen.add(tk)
+            thread_keys.append(tk)
+
+    if not thread_keys:
+        return json.dumps({
+            "project_hint": project_hint,
+            "offset": offset,
+            "batch_size": batch_size,
+            "batch_len": 0,
+            "has_more": False,
+            "thread_keys": [],
+            "total_messages": 0,
+            "batch": []
+        }, ensure_ascii=False, indent=2)
+
+    quoted_keys = ", ".join(f"'{_escape_ch_string(tk)}'" for tk in thread_keys)
+
+    query = f"""
+    SELECT
+        e.id,
+        e.thread_key,
+        e.message_id,
+        e.subject,
+        e.from_addr,
+        e.to_addr,
+        e.cc_addr,
+        e.bcc_addr,
+        e.sent_at_utc,
+        e.folder,
+        p.parsed_json
+    FROM mailkb.emails_unique e
+    INNER JOIN mailkb.mail_parsed p
+        ON e.id = p.email_id
+    WHERE e.thread_key IN ({quoted_keys})
+    ORDER BY e.sent_at_utc ASC, e.id ASC
+    """
+
+    df = client_clickhouse.query_df(query)
+    docs = build_message_docs(df)
+
+    deduped = []
+    seen_msg = set()
+
+    for d in docs:
+        dedup_key = (
+            f"{d.metadata.get('email_id')}::"
+            f"{d.metadata.get('mail_query_number')}::"
+            f"{d.metadata.get('date')}::"
+            f"{d.page_content[:120]}"
+        )
+        if dedup_key in seen_msg:
+            continue
+        seen_msg.add(dedup_key)
+        deduped.append(d)
+
+    deduped.sort(
+        key=lambda d: (
+            d.metadata.get("date") or d.metadata.get("sent_at_utc") or "",
+            str(d.metadata.get("mail_query_number") or "")
+        )
+    )
+
+    batch_docs = deduped[offset: offset + batch_size]
+
+    batch = []
+    for d in batch_docs:
+        md = d.metadata or {}
+        batch.append({
+            "thread_key": md.get("thread_key"),
+            "email_id": md.get("email_id"),
+            "message_id": md.get("message_id"),
+            "subject": md.get("subject"),
+            "topic": md.get("topic"),
+            "sent_at_utc": md.get("date") or md.get("sent_at_utc"),
+            "participants": md.get("participants") or [],
+            "keywords": md.get("keywords") or [],
+            "folder": md.get("folder"),
+            "snippet": d.page_content[:800] if d.page_content else None,
+        })
+
+    return json.dumps({
+        "project_hint": project_hint,
+        "offset": offset,
+        "batch_size": batch_size,
+        "batch_len": len(batch),
+        "has_more": offset + batch_size < len(deduped),
+        "thread_keys": thread_keys,
+        "total_messages": len(deduped),
+        "batch": batch
+    }, ensure_ascii=False, indent=2)
+
+
+@tool
+def save_summary(summary_text: str, batch_id: int) -> str:
+    """
+    Сохранить summary батча в summaries/summary_batch_{batch_id}.txt
+    """
+    p = SUMMARY_DIR / f"summary_batch_{batch_id}.txt"
+    p.write_text(summary_text, encoding="utf-8")
+    return f"saved_to={str(p)}"
+
+
+@tool
+def load_all_summaries() -> str:
+    """
+    Прочитать все summary_batch_*.txt и вернуть объединённый текст.
+    """
+    files = sorted(SUMMARY_DIR.glob("summary_batch_*.txt"))
+
+    if not files:
+        return "NO_SUMMARIES_FOUND"
+
+    texts = []
+    for file in files:
+        content = file.read_text(encoding="utf-8")
+        texts.append(f"===== {file.name} =====\n{content}\n")
+
+    return "\n".join(texts)
+#%%
+print(search_project_threads.invoke({"project_hint": "Segezha", "limit": 10}))
+#%%
+print(get_project_corpus_batch.invoke({
+    "project_hint": "Segezha",
+    "offset": 0,
+    "batch_size": 5,
+    "thread_limit": 2 # было 10
+}))
+#%% md
+###  1. Batch-agent
+#%%
+from langchain.agents import create_agent
+from langchain.agents.middleware import PIIMiddleware, SummarizationMiddleware
+
+SYSTEM_PROMPT_BATCH = """
+Ты — аналитик проектной переписки.
+
+Твоя задача — обработать корпус сообщений по проекту батчами.
+Корпус уже собран из релевантных обсуждений проекта.
+
+Работай строго по циклу:
+
+1. Определи project_hint из запроса пользователя.
+2. Вызови get_project_corpus_batch(project_hint, offset, batch_size=50).
+3. Получи batch.
+4. На основе только этого batch сделай summary.
+5. Сохрани summary через save_summary(summary_text, batch_id).
+6. Если has_more = true — увеличь offset на batch_size и продолжай.
+7. Если has_more = false — сообщи, что все батчи обработаны.
+
+Ограничения:
+- Не делай глобального отчёта.
+- Не объединяй выводы между батчами.
+- Каждый summary должен описывать только текущий batch.
+- Не пропускай save_summary.
+- Не используй никакие другие инструменты кроме get_project_corpus_batch и save_summary.
+
+Для каждого батча извлекай:
+1. Основные темы
+2. Что обсуждалось
+3. Решения / договорённости
+4. Проблемы / риски / открытые вопросы
+5. Явные задачи
+6. Вероятные задачи
+7. Явных ответственных
+8. Вероятных ответственных
+9. Краткий вывод по батчу
+
+Важно:
+- Если задача или ответственный не сформулированы явно, можешь аккуратно реконструировать их,
+  но обязательно явно разделяй:
+  - "Явно указано"
+  - "Вероятно следует из контекста"
+"""
+
+agent_batch = create_agent(
+    model="deepseek-chat",
+    tools=[
+        get_project_corpus_batch,
+        save_summary,
+    ],
+    system_prompt=SYSTEM_PROMPT_BATCH,
+    middleware=[
+        PIIMiddleware("email", strategy="redact", apply_to_input=True),
+        PIIMiddleware(
+            "phone_number",
+            detector=(
+                r"(?:\+?\d{1,3}[\s.-]?)?"
+                r"(?:\(?\d{2,4}\)?[\s.-]?)?"
+                r"\d{3,4}[\s.-]?\d{4}"
+            ),
+            strategy="redact",
+        ),
+        SummarizationMiddleware(
+            model="deepseek-chat",
+            max_tokens_before_summary=1200,
+        ),
+    ],
+)
+#%%
+result_batch = agent_batch.invoke({
+    "messages": [
+        {
+            "role": "user",
+            "content": (
+                "Начни обработку проекта Segezha батчами. "
+                "Делай summary каждого батча и сохраняй их через save_summary. "
+                "Итоговый отчёт не делай."
+            )
+        }
+    ]
+})
+
+print(result_batch["messages"][-1].content)
+#%% md
+### 2. Global-agent
+#%%
+SYSTEM_PROMPT_GLOBAL = """
+Ты — эксперт по агрегированию проектной переписки.
+
+Твоя задача:
+1. Вызвать load_all_summaries().
+2. На основе всех summary батчей сделать единый итоговый отчёт по проекту.
+
+Структура итогового отчёта:
+1. Краткое резюме проекта
+2. Основные темы обсуждений
+3. Ключевые решения и к чему пришли
+4. Явные задачи и ответственные
+5. Вероятные задачи и вероятные ответственные
+6. Проблемы, риски, открытые вопросы
+7. Повторяющиеся инциденты / узкие места
+8. Итоговый вывод
+
+Важно:
+- Не переписывай summaries батчей дословно.
+- Делай смысловую агрегацию.
+- Если задача/ответственный восстановлены по контексту, помечай это отдельно.
+- Если есть противоречия между батчами, укажи их.
+"""
+
+agent_global = create_agent(
+    model="deepseek-chat",
+    tools=[load_all_summaries],
+    system_prompt=SYSTEM_PROMPT_GLOBAL,
+    middleware=[
+        PIIMiddleware("email", strategy="redact", apply_to_input=True),
+        PIIMiddleware(
+            "phone_number",
+            detector=(
+                r"(?:\+?\d{1,3}[\s.-]?)?"
+                r"(?:\(?\d{2,4}\)?[\s.-]?)?"
+                r"\d{3,4}[\s.-]?\d{4}"
+            ),
+            strategy="redact",
+        ),
+        SummarizationMiddleware(
+            model="deepseek-chat",
+            max_tokens_before_summary=2000,
+        ),
+    ],
+)
+#%%
+result_global = agent_global.invoke({
+    "messages": [
+        {
+            "role": "user",
+            "content": "Сделай итоговый отчёт по проекту Segezha на основе сохранённых batch summaries."
+        }
+    ]
+})
+
+print(result_global["messages"][-1].content)
+#%%
+def clear_summaries():
+    for f in SUMMARY_DIR.glob("summary_batch_*.txt"):
+        f.unlink()
+
+
+clear_summaries()
+print("Old summaries cleared.")
+#%%
+
+#%% md
+### ручной тест
+#%%
+print(search_project_threads.invoke({"project_hint": "Segezha", "limit": 10}))
+#%%
+print(get_project_corpus_batch.invoke({
+    "project_hint": "Segezha",
+    "offset": 0,
+    "batch_size": 5,
+    "thread_limit": 10
+}))
+#%%
