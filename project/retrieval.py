@@ -178,6 +178,7 @@ def get_project_corpus_batch(
 
 @tool
 def save_summary(summary_text: str, batch_id: int) -> str:
+    """Save summary text to a file for the given batch ID."""
     p = SUMMARY_DIR / f"summary_batch_{batch_id}.txt"
     p.write_text(summary_text, encoding="utf-8")
     return f"saved_to={str(p)}"
@@ -185,6 +186,7 @@ def save_summary(summary_text: str, batch_id: int) -> str:
 
 @tool
 def load_all_summaries() -> str:
+    """Load all previously saved summaries from the filesystem."""
     files = sorted(SUMMARY_DIR.glob("summary_batch_*.txt"))
 
     if not files:

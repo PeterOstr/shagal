@@ -1,0 +1,9 @@
+pytest>=8.0
+httpx>=0.27
+
+# For UI E2E tests (project/ui/):
+# Requires Node.js 18+ and npm
+#   cd project/ui
+#   npm install
+#   npm test            # headless
+#   npm run test:headed # with browser window

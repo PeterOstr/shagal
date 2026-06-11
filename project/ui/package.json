@@ -1,0 +1,17 @@
+{
+  "name": "mailkb-ui",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node tests/ui.spec.mjs",
+    "test:headed": "HEADED=1 node tests/ui.spec.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.52.0"
+  }
+}

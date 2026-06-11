@@ -1,6 +1,12 @@
-from fastapi import FastAPI
+import json
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from config import CLICKHOUSE_DATABASE
+from infra import get_clickhouse_client
 from pipeline import (
     clean_email_bodies_from_db,
     deduplicate_emails,
@@ -17,6 +23,15 @@ from retrieval import (
 )
 
 app = FastAPI(title="mailkb backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SQL_DIR = Path(__file__).parent / "sql"
 
 
 class CleanBodiesRequest(BaseModel):
@@ -51,9 +66,33 @@ class AnalysisRequest(BaseModel):
     project_hint: str
 
 
+def _run_sql_file(client, path: Path):
+    sql = path.read_text(encoding="utf-8").strip()
+    if not sql:
+        return {"file": path.name, "status": "skipped (empty)"}
+    client.query(sql)
+    return {"file": path.name, "status": "ok"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/pipeline/init-db")
+def api_init_db():
+    if not SQL_DIR.is_dir():
+        raise HTTPException(404, f"SQL directory not found: {SQL_DIR}")
+    client = get_clickhouse_client()
+    client.query(f"CREATE DATABASE IF NOT EXISTS {CLICKHOUSE_DATABASE}")
+    files = sorted(SQL_DIR.glob("*.sql"))
+    results = []
+    for path in files:
+        try:
+            results.append(_run_sql_file(client, path))
+        except Exception as e:
+            results.append({"file": path.name, "status": f"error: {e}"})
+    return {"status": "ok", "results": results}
 
 
 @app.post("/pipeline/import-mbox")
@@ -98,20 +137,22 @@ def api_index_messages(payload: IndexMessagesRequest):
 
 @app.post("/search/threads")
 def api_search_threads(payload: SearchThreadsRequest):
-    return search_project_threads.invoke({
+    result = search_project_threads.invoke({
         "project_hint": payload.project_hint,
         "limit": payload.limit,
     })
+    return json.loads(result)
 
 
 @app.post("/search/corpus-batch")
 def api_corpus_batch(payload: CorpusBatchRequest):
-    return get_project_corpus_batch.invoke({
+    result = get_project_corpus_batch.invoke({
         "project_hint": payload.project_hint,
         "offset": payload.offset,
         "batch_size": payload.batch_size,
         "thread_limit": payload.thread_limit,
     })
+    return json.loads(result)
 
 
 @app.post("/analysis/batch")

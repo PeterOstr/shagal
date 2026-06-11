@@ -1,0 +1,18 @@
+FROM node:20-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package.json ./
+RUN npm install --include=dev
+
+COPY tests ./tests
+COPY public ./public
+COPY server.js ./
+
+ENV HEADED=0
+CMD ["node", "tests/ui.spec.js"]

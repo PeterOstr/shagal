@@ -42,7 +42,6 @@ def get_embeddings():
         model=EMBEDDINGS_MODEL,
         api_key="not-needed",
         base_url=EMBEDDINGS_BASE_URL,
-        tiktoken_enabled=False,
     )
 
 

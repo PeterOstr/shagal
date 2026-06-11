@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MailKB — управление email-архивом</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">📧 MailKB</div>
+  <nav>
+    <button class="tab active" data-tab="pipeline">🔧 Pipeline</button>
+    <button class="tab" data-tab="search">🔍 Поиск</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ===================== PIPELINE TAB ===================== -->
+  <section id="tab-pipeline" class="tab-content active">
+    <h2>Pipeline обработки писем</h2>
+    <p class="subtitle">Выполняйте шаги по порядку или запустите всё сразу.</p>
+
+    <div id="pipeline-steps"></div>
+
+    <div class="run-all-wrapper">
+      <button id="run-all" class="btn btn-primary">🚀 Запустить весь pipeline</button>
+    </div>
+  </section>
+
+  <!-- ===================== SEARCH TAB ===================== -->
+  <section id="tab-search" class="tab-content">
+    <h2>Поиск и анализ по проекту</h2>
+    <p class="subtitle">Найдите информацию в email-архиве по названию проекта.</p>
+
+    <div class="search-form">
+      <input type="text" id="project-input" placeholder="Название проекта, например: segezha, sibur" />
+
+      <div class="search-buttons">
+        <button class="btn btn-search" data-action="search-threads">🔍 Поиск тредов</button>
+        <button class="btn btn-search" data-action="corpus-batch">📋 Корпус батч</button>
+        <button class="btn btn-search" data-action="batch-analysis">📊 Батч-анализ</button>
+        <button class="btn btn-search" data-action="global-analysis">🌐 Глобальный отчёт</button>
+        <button class="btn btn-danger" data-action="clear-summaries">🗑 Очистить summaries</button>
+      </div>
+    </div>
+
+    <div id="search-results" class="results-area"></div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

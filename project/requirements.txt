@@ -9,3 +9,7 @@ langchain
 langchain-core
 langchain-openai
 langchain-qdrant
+requests
+beautifulsoup4
+tqdm
+langchain-deepseek

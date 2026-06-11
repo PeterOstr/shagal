@@ -1,0 +1,7 @@
+services:
+  api:
+    depends_on:
+      clickhouse:
+        condition: service_started
+      qdrant:
+        condition: service_started
