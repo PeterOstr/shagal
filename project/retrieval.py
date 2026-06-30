@@ -1,30 +1,28 @@
 import json
 from pathlib import Path
 
-from langchain.agents import create_agent
-from langchain.agents.middleware import PIIMiddleware, SummarizationMiddleware
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
 
 from config import (
     LLM_MODEL,
     MESSAGES_COLLECTION,
     SUMMARY_DIR,
-    THREADS_COLLECTION,
 )
-from infra import ensure_collection, get_clickhouse_client
+from infra import _get_llm, ensure_collection, get_clickhouse_client
 from pipeline import build_message_docs
 
 
-threads_qv = ensure_collection(THREADS_COLLECTION, recreate=False)
 messages_qv = ensure_collection(MESSAGES_COLLECTION, recreate=False)
 
 
 @tool
 def search_project_threads(project_hint: str, limit: int = 30) -> str:
     """
-    Найти релевантные обсуждения проекта в коллекции mailkb_threads.
+    Найти релевантные обсуждения проекта в коллекции mailkb_messages.
     """
-    docs = threads_qv.similarity_search(project_hint, k=limit)
+    docs = messages_qv.similarity_search(project_hint, k=limit * 3)
 
     results = []
     seen = set()
@@ -40,13 +38,15 @@ def search_project_threads(project_hint: str, limit: int = 30) -> str:
         results.append({
             "thread_key": thread_key,
             "subject": md.get("subject"),
+            "topic": md.get("topic"),
             "participants": md.get("participants") or [],
             "keywords": md.get("keywords") or [],
-            "message_count": md.get("message_count"),
-            "first_date": md.get("first_date"),
-            "last_date": md.get("last_date"),
+            "date": md.get("date"),
             "snippet": (doc.page_content[:800] + "…") if doc.page_content else None,
         })
+
+        if len(results) >= limit:
+            break
 
     return json.dumps(
         {"project_hint": project_hint, "threads": results},
@@ -68,24 +68,27 @@ def get_project_corpus_batch(
 ) -> str:
     """
     Собрать батч корпуса проекта:
-    1) найти релевантные thread_key в mailkb_threads
-    2) достать все сообщения по этим thread_key
+    1) найти релевантные thread_key в mailkb_messages
+    2) достать все сообщения по этим thread_key из ClickHouse
     3) дедуплицировать и отсортировать
     4) вернуть батч по offset/batch_size
     """
     client = get_clickhouse_client()
 
-    thread_docs = threads_qv.similarity_search(project_hint, k=thread_limit)
+    msg_docs = messages_qv.similarity_search(project_hint, k=thread_limit * 3)
 
     thread_keys = []
     seen = set()
 
-    for doc in thread_docs:
+    for doc in msg_docs:
         md = doc.metadata or {}
         tk = md.get("thread_key")
         if tk and tk not in seen:
             seen.add(tk)
             thread_keys.append(tk)
+
+        if len(thread_keys) >= thread_limit:
+            break
 
     if not thread_keys:
         return json.dumps({
@@ -273,50 +276,20 @@ SYSTEM_PROMPT_GLOBAL = """
 
 
 def build_batch_agent():
-    return create_agent(
-        model=LLM_MODEL,
-        tools=[get_project_corpus_batch, save_summary],
-        system_prompt=SYSTEM_PROMPT_BATCH,
-        middleware=[
-            PIIMiddleware("email", strategy="redact", apply_to_input=True),
-            PIIMiddleware(
-                "phone_number",
-                detector=(
-                    r"(?:\+?\d{1,3}[\s.-]?)?"
-                    r"(?:\(?\d{2,4}\)?[\s.-]?)?"
-                    r"\d{3,4}[\s.-]?\d{4}"
-                ),
-                strategy="redact",
-            ),
-            SummarizationMiddleware(
-                model=LLM_MODEL,
-                max_tokens_before_summary=1200,
-            ),
-        ],
+    llm = _get_llm()
+    return create_react_agent(
+        llm,
+        [get_project_corpus_batch, save_summary],
+        prompt=SystemMessage(SYSTEM_PROMPT_BATCH),
     )
 
 
 def build_global_agent():
-    return create_agent(
-        model=LLM_MODEL,
-        tools=[load_all_summaries],
-        system_prompt=SYSTEM_PROMPT_GLOBAL,
-        middleware=[
-            PIIMiddleware("email", strategy="redact", apply_to_input=True),
-            PIIMiddleware(
-                "phone_number",
-                detector=(
-                    r"(?:\+?\d{1,3}[\s.-]?)?"
-                    r"(?:\(?\d{2,4}\)?[\s.-]?)?"
-                    r"\d{3,4}[\s.-]?\d{4}"
-                ),
-                strategy="redact",
-            ),
-            SummarizationMiddleware(
-                model=LLM_MODEL,
-                max_tokens_before_summary=2000,
-            ),
-        ],
+    llm = _get_llm()
+    return create_react_agent(
+        llm,
+        [load_all_summaries],
+        prompt=SystemMessage(SYSTEM_PROMPT_GLOBAL),
     )
 
 
@@ -324,14 +297,11 @@ def run_batch_analysis(project_hint: str):
     agent_batch = build_batch_agent()
     result_batch = agent_batch.invoke({
         "messages": [
-            {
-                "role": "user",
-                "content": (
-                    f"Начни обработку проекта {project_hint} батчами. "
-                    "Делай summary каждого батча и сохраняй их через save_summary. "
-                    "Итоговый отчёт не делай."
-                )
-            }
+            HumanMessage(
+                f"Начни обработку проекта {project_hint} батчами. "
+                "Делай summary каждого батча и сохраняй их через save_summary. "
+                "Итоговый отчёт не делай."
+            )
         ]
     })
     return result_batch["messages"][-1].content
@@ -341,10 +311,7 @@ def run_global_analysis(project_hint: str):
     agent_global = build_global_agent()
     result_global = agent_global.invoke({
         "messages": [
-            {
-                "role": "user",
-                "content": f"Сделай итоговый отчёт по проекту {project_hint} на основе сохранённых batch summaries."
-            }
+            HumanMessage(f"Сделай итоговый отчёт по проекту {project_hint} на основе сохранённых batch summaries.")
         ]
     })
     return result_global["messages"][-1].content

@@ -23,6 +23,8 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "20000"))
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 EMBEDDINGS_BASE_URL = os.getenv("EMBEDDINGS_BASE_URL", "http://localhost:8000/v1")
 EMBEDDINGS_MODEL = os.getenv("EMBEDDINGS_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 # Qdrant
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")

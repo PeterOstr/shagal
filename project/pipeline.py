@@ -13,9 +13,8 @@ from typing import List
 
 import pandas as pd
 from bs4 import BeautifulSoup
-from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 
@@ -29,6 +28,7 @@ from config import (
     SAVE_ATTACHMENTS,
 )
 from infra import (
+    _get_llm,
     build_structured_agent,
     ensure_collection,
     get_clickhouse_client,
@@ -438,13 +438,11 @@ def body_md5(text):
 
 
 def clean_email_body(text: str):
-    result = clean_single_agent.invoke({
-        "messages": [
-            {"role": "system", "content": CLEAN_PROMPT},
-            {"role": "user", "content": text}
-        ]
-    })
-    return result["structured_response"].body_clean
+    result = clean_single_agent.invoke([
+        SystemMessage(CLEAN_PROMPT),
+        HumanMessage(text)
+    ])
+    return result.body_clean
 
 
 def clean_email_bodies_batch(md5_and_text: List[tuple[str, str]]) -> dict[str, str]:
@@ -454,14 +452,12 @@ def clean_email_bodies_batch(md5_and_text: List[tuple[str, str]]) -> dict[str, s
 
     user_content = "\n\n---\n\n".join(blocks)
 
-    result = clean_batch_agent.invoke({
-        "messages": [
-            {"role": "system", "content": CLEAN_BATCH_PROMPT},
-            {"role": "user", "content": user_content}
-        ]
-    })
+    result = clean_batch_agent.invoke([
+        SystemMessage(CLEAN_BATCH_PROMPT),
+        HumanMessage(user_content)
+    ])
 
-    batch_obj: CleanBatch = result["structured_response"]
+    batch_obj: CleanBatch = result
 
     out = {}
     for item in batch_obj.items:
@@ -592,11 +588,7 @@ class ParsedEmailBatch(BaseModel):
 
 parse_agent = build_structured_agent(ParsedEmailBatch)
 
-llm = init_chat_model(
-    model=LLM_MODEL,
-    temperature=0
-)
-structured_llm = llm.with_structured_output(ParsedEmailBatch)
+structured_llm = _get_llm().with_structured_output(ParsedEmailBatch)
 
 
 def chunk_list(rows, batch_size):

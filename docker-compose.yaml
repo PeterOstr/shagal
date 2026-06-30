@@ -101,7 +101,7 @@ services:
     ports:
       - "8501:8501"
     environment:
-      - API_BASE=http://api:8010
+      - API_BASE=http://localhost:8010
       - PORT=8501
     depends_on:
       api:

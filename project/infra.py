@@ -1,8 +1,7 @@
 from functools import lru_cache
 
 import clickhouse_connect
-from langchain.agents import create_agent
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
@@ -13,9 +12,11 @@ from config import (
     CLICKHOUSE_DATABASE,
     CLICKHOUSE_PASSWORD,
     CLICKHOUSE_USER,
+    DEEPSEEK_API_KEY,
     EMBEDDINGS_BASE_URL,
     EMBEDDINGS_MODEL,
     LLM_MODEL,
+    OPENAI_API_KEY,
     QDRANT_URL,
 )
 
@@ -79,9 +80,20 @@ def ensure_collection(collection_name: str, recreate: bool = False) -> QdrantVec
     )
 
 
-def build_structured_agent(response_format):
-    return create_agent(
+def _get_llm():
+    if "deepseek" in LLM_MODEL.lower():
+        return ChatOpenAI(
+            model=LLM_MODEL,
+            temperature=0,
+            api_key=DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com/v1",
+        )
+    return ChatOpenAI(
         model=LLM_MODEL,
-        tools=[],
-        response_format=response_format,
+        temperature=0,
+        api_key=OPENAI_API_KEY,
     )
+
+
+def build_structured_agent(response_format):
+    return _get_llm().with_structured_output(response_format)
