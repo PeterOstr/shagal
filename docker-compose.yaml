@@ -71,7 +71,7 @@ services:
     ports:
       - "8010:8010"
     environment:
-      - CH_HOST=clickhouse
+      - CH_HOST=84.201.160.255
       - CH_PORT=8123
       - CLICKHOUSE_USER=peter
       - CLICKHOUSE_PASSWORD=1234
@@ -86,8 +86,6 @@ services:
     volumes:
       - summaries_data:/app/summaries
     depends_on:
-      clickhouse:
-        condition: service_healthy
       qdrant:
         condition: service_started
     restart: unless-stopped

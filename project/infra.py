@@ -95,5 +95,5 @@ def _get_llm():
     )
 
 
-def build_structured_agent(response_format):
-    return _get_llm().with_structured_output(response_format)
+def build_structured_agent(response_format, method="json_mode"):
+    return _get_llm().with_structured_output(response_format, method=method)

@@ -14,7 +14,8 @@ def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("import-mbox")
+    import_parser = subparsers.add_parser("import-mbox")
+    import_parser.add_argument("--max-emails", type=int, default=0)
     subparsers.add_parser("dedup")
     subparsers.add_parser("clear-summaries")
 
@@ -33,6 +34,7 @@ def main():
 
     batch_analysis = subparsers.add_parser("batch-analysis")
     batch_analysis.add_argument("project_hint", type=str)
+    batch_analysis.add_argument("--max-batches", type=int, default=0)
 
     global_analysis = subparsers.add_parser("global-analysis")
     global_analysis.add_argument("project_hint", type=str)
@@ -40,7 +42,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "import-mbox":
-        import_mbox_to_clickhouse()
+        import_mbox_to_clickhouse(max_emails=args.max_emails)
     elif args.command == "dedup":
         deduplicate_emails()
     elif args.command == "clean-bodies":
@@ -61,7 +63,7 @@ def main():
             recreate=args.recreate,
         )
     elif args.command == "batch-analysis":
-        print(run_batch_analysis(args.project_hint))
+        print(run_batch_analysis(args.project_hint, max_batches=args.max_batches))
     elif args.command == "global-analysis":
         print(run_global_analysis(args.project_hint))
     elif args.command == "clear-summaries":

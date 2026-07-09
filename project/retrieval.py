@@ -68,8 +68,8 @@ def get_project_corpus_batch(
 ) -> str:
     """
     Собрать батч корпуса проекта:
-    1) найти релевантные thread_key в mailkb_messages
-    2) достать все сообщения по этим thread_key из ClickHouse
+    1) найти релевантные email_id в mailkb_messages
+    2) достать все сообщения по этим email_id из ClickHouse
     3) дедуплицировать и отсортировать
     4) вернуть батч по offset/batch_size
     """
@@ -77,32 +77,22 @@ def get_project_corpus_batch(
 
     msg_docs = messages_qv.similarity_search(project_hint, k=thread_limit * 3)
 
-    thread_keys = []
-    seen = set()
+    email_ids = list(dict.fromkeys(d.metadata.get("email_id") for d in msg_docs if d.metadata.get("email_id")))
+    thread_keys = list(dict.fromkeys(d.metadata.get("thread_key") for d in msg_docs if d.metadata.get("thread_key")))
 
-    for doc in msg_docs:
-        md = doc.metadata or {}
-        tk = md.get("thread_key")
-        if tk and tk not in seen:
-            seen.add(tk)
-            thread_keys.append(tk)
-
-        if len(thread_keys) >= thread_limit:
-            break
-
-    if not thread_keys:
+    if not email_ids:
         return json.dumps({
             "project_hint": project_hint,
             "offset": offset,
             "batch_size": batch_size,
             "batch_len": 0,
             "has_more": False,
-            "thread_keys": [],
+            "thread_keys": thread_keys,
             "total_messages": 0,
             "batch": []
         }, ensure_ascii=False, indent=2)
 
-    quoted_keys = ", ".join(f"'{_escape_ch_string(tk)}'" for tk in thread_keys)
+    quoted_ids = ", ".join(f"'{_escape_ch_string(eid)}'" for eid in email_ids)
 
     query = f"""
     SELECT
@@ -120,7 +110,7 @@ def get_project_corpus_batch(
     FROM mailkb.emails_unique e
     INNER JOIN mailkb.mail_parsed p
         ON e.id = p.email_id
-    WHERE e.thread_key IN ({quoted_keys})
+    WHERE e.id IN ({quoted_ids})
     ORDER BY e.sent_at_utc ASC, e.id ASC
     """
 
@@ -293,12 +283,14 @@ def build_global_agent():
     )
 
 
-def run_batch_analysis(project_hint: str):
+def run_batch_analysis(project_hint: str, max_batches: int = 0):
     agent_batch = build_batch_agent()
+    limit_clause = f"Обработай не более {max_batches} батчей. " if max_batches > 0 else ""
     result_batch = agent_batch.invoke({
         "messages": [
             HumanMessage(
                 f"Начни обработку проекта {project_hint} батчами. "
+                f"{limit_clause}"
                 "Делай summary каждого батча и сохраняй их через save_summary. "
                 "Итоговый отчёт не делай."
             )

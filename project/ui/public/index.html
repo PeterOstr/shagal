@@ -3,48 +3,58 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MailKB — управление email-архивом</title>
+  <title data-i18n="title">MailKB — управление email-архивом</title>
   <link rel="stylesheet" href="style.css">
+  <script src="marked.min.js"></script>
 </head>
 <body>
 
 <header>
-  <div class="logo">📧 MailKB</div>
+  <div class="logo">MailKB</div>
   <nav>
-    <button class="tab active" data-tab="pipeline">🔧 Pipeline</button>
-    <button class="tab" data-tab="search">🔍 Поиск</button>
+    <button class="tab active" data-tab="pipeline" data-i18n="tab_pipeline">🔧 Pipeline</button>
+    <button class="tab" data-tab="search" data-i18n="tab_search">🔍 Поиск</button>
   </nav>
+  <div class="lang-switcher">
+    <button id="lang-btn" class="lang-btn" title="Switch language">RU</button>
+  </div>
 </header>
 
 <main>
   <!-- ===================== PIPELINE TAB ===================== -->
   <section id="tab-pipeline" class="tab-content active">
-    <h2>Pipeline обработки писем</h2>
-    <p class="subtitle">Выполняйте шаги по порядку или запустите всё сразу.</p>
+    <h2 data-i18n="pipeline_title">Pipeline обработки писем</h2>
+    <p class="subtitle" data-i18n="pipeline_subtitle">Выполняйте шаги по порядку или запустите всё сразу.</p>
 
     <div id="pipeline-steps"></div>
 
     <div class="run-all-wrapper">
-      <button id="run-all" class="btn btn-primary">🚀 Запустить весь pipeline</button>
+      <button id="run-all" class="btn btn-primary" data-i18n="run_all">🚀 Запустить весь pipeline</button>
     </div>
   </section>
 
   <!-- ===================== SEARCH TAB ===================== -->
   <section id="tab-search" class="tab-content">
-    <h2>Поиск и анализ по проекту</h2>
-    <p class="subtitle">Найдите информацию в email-архиве по названию проекта.</p>
+    <h2 data-i18n="search_title">Поиск и анализ по проекту</h2>
+    <p class="subtitle" data-i18n="search_subtitle">Найдите информацию в email-архиве по названию проекта.</p>
 
-    <div class="search-form">
-      <input type="text" id="project-input" placeholder="Название проекта, например: segezha, sibur" />
+      <div class="search-form">
+        <input type="text" id="project-input" data-i18n-placeholder="search_placeholder" placeholder="Название проекта, например: segezha, sibur" />
 
-      <div class="search-buttons">
-        <button class="btn btn-search" data-action="search-threads">🔍 Поиск тредов</button>
-        <button class="btn btn-search" data-action="corpus-batch">📋 Корпус батч</button>
-        <button class="btn btn-search" data-action="batch-analysis">📊 Батч-анализ</button>
-        <button class="btn btn-search" data-action="global-analysis">🌐 Глобальный отчёт</button>
-        <button class="btn btn-danger" data-action="clear-summaries">🗑 Очистить summaries</button>
+        <div class="search-row">
+          <div class="search-buttons">
+            <button class="btn btn-search" data-action="search-threads" data-i18n="btn_threads">🔍 Поиск тредов</button>
+            <button class="btn btn-search" data-action="corpus-batch" data-i18n="btn_corpus">📋 Корпус батч</button>
+            <button class="btn btn-search" data-action="batch-analysis" data-i18n="btn_batch">📊 Батч-анализ</button>
+            <button class="btn btn-search" data-action="global-analysis" data-i18n="btn_global">🌐 Глобальный отчёт</button>
+            <button class="btn btn-danger" data-action="clear-summaries" data-i18n="btn_clear">🗑 Очистить summaries</button>
+          </div>
+          <div class="batch-limit">
+            <label for="max-batches" data-i18n="batch_limit">Лимит батчей:</label>
+            <input type="number" id="max-batches" min="0" max="100" value="2" title="0 — без лимита" />
+          </div>
+        </div>
       </div>
-    </div>
 
     <div id="search-results" class="results-area"></div>
   </section>

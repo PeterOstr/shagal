@@ -1,12 +1,14 @@
 import hashlib
 import json
 import mailbox
+import os
 import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.header import decode_header
+from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import List
@@ -15,7 +17,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from tqdm import tqdm
 
 from config import (
@@ -88,6 +90,36 @@ def iter_mbox_files(base):
             yield mbox_path
 
 
+def _iter_mbox(fp: str):
+    """Read mbox file, yield email.message.Message objects.
+    
+    Replacement for mailbox.mbox which hangs on large files with Python 3.14.
+    """
+    import email
+    from email import policy as _policy
+
+    buf = []
+    with open(fp, "rb") as f:
+        for raw_line in f:
+            if raw_line.startswith(b"From "):
+                if buf:
+                    msg_bytes = b"".join(buf)
+                    if msg_bytes.strip():
+                        yield email.message_from_bytes(
+                            msg_bytes, policy=_policy.compat32
+                        )
+                buf = []
+            elif raw_line.startswith(b">From "):
+                buf.append(raw_line[1:])
+            else:
+                buf.append(raw_line)
+
+        if buf:
+            msg_bytes = b"".join(buf)
+            if msg_bytes.strip():
+                yield email.message_from_bytes(msg_bytes, policy=_policy.compat32)
+
+
 def extract_body(msg):
     body_text = ""
     body_html = ""
@@ -130,21 +162,27 @@ def extract_body(msg):
     return body_text, body_html
 
 
-def import_mbox_to_clickhouse():
+def import_mbox_to_clickhouse(max_emails: int = 0):
     client = get_clickhouse_client()
 
     emails_rows = []
     attach_rows = []
+    total = 0
 
     ensure_dir(ATTACH_DIR)
 
     for mbox_path in iter_mbox_files(MBOX_DIR):
+        if max_emails > 0 and total >= max_emails:
+            break
         print("Processing:", mbox_path)
 
         folder_name = str(mbox_path.parent.relative_to(MBOX_DIR))
-        mbox = mailbox.mbox(str(mbox_path))
+        folder_name = folder_name.replace("\\", "/")
 
-        for msg in tqdm(mbox, desc=folder_name):
+        for msg in tqdm(_iter_mbox(str(mbox_path)), desc=folder_name):
+            if max_emails > 0 and total >= max_emails:
+                break
+            total += 1
             stable_id = str(uuid.uuid4())
 
             message_id = str((msg.get("Message-ID") or msg.get("Message-Id") or "").strip())
@@ -475,14 +513,17 @@ def clean_email_bodies_from_db(fetch_batch: int = 30, llm_batch: int = 5):
     """).result_rows)
     print("Cached:", len(cached_md5))
 
+    last_id = "00000000-0000-0000-0000-000000000000"
+
     while True:
         rows = client.query("""
             SELECT id, body_text
-            FROM mailkb.emails
+            FROM mailkb.emails_unique
             WHERE body_text IS NOT NULL AND body_text != ''
-            ORDER BY rand()
+              AND id > %(last_id)s
+            ORDER BY id
             LIMIT %(limit)s
-        """, {"limit": fetch_batch}).result_rows
+        """, {"last_id": last_id, "limit": fetch_batch}).result_rows
 
         if not rows:
             print("No rows found, stop.")
@@ -500,8 +541,10 @@ def clean_email_bodies_from_db(fetch_batch: int = 30, llm_batch: int = 5):
             batch_meta.append((email_id, md5, body))
 
         if not to_process:
-            print("All fetched rows already cached; fetching next...")
+            last_id = rows[-1][0]
             continue
+
+        last_id = rows[-1][0]
 
         for i in range(0, len(to_process), llm_batch):
             chunk = to_process[i:i + llm_batch]
@@ -569,26 +612,63 @@ def clean_email_bodies_from_db(fetch_batch: int = 30, llm_batch: int = 5):
 # 4. parse emails -> mail_parsed
 # =========================================================
 
-class MailInfo(BaseModel):
-    topic: str = Field(description="Topic of the email")
-    email_body: str = Field(description="Clean email body")
-    date: str = Field(description="Date of the email YYYY-MM-DD")
-    mail_query_number: int = Field(description="Order number of the email in the chain")
-    key_words: List[str] = Field(description="Important keywords")
+def coerce_str(v):
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        return str(v)
+    return v
+
+def coerce_str_list(v):
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    return [str(x) if x is not None else "" for x in v] if isinstance(v, list) else []
+
+
+class ThreadEntry(BaseModel):
+    from_: str = Field(alias="from", default="")
+    to: list[str] = Field(default_factory=list)
+    cc: list[str] = Field(default_factory=list)
+    subject: str = ""
+    date: str = ""
+    body: str = ""
+
+    @field_validator("from_", "subject", "body", "date", mode="before")
+    @classmethod
+    def coerce_str_fields(cls, v):
+        return coerce_str(v)
+
+    @field_validator("to", "cc", mode="before")
+    @classmethod
+    def coerce_list_fields(cls, v):
+        return coerce_str_list(v)
 
 
 class ParsedEmailResult(BaseModel):
-    email_id: str = Field(description="Original email id from the input batch")
-    emails: List[MailInfo] = Field(description="Parsed content for this email")
+    email_id: str
+    thread: list[ThreadEntry] = Field(default_factory=list)
 
 
 class ParsedEmailBatch(BaseModel):
-    items: List[ParsedEmailResult] = Field(description="Parsed results for all emails in the batch")
+    emails: list[ParsedEmailResult] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_input(cls, data):
+        if isinstance(data, list):
+            return {"emails": data}
+        if isinstance(data, dict):
+            for key in ("emails", "batch", "results", "items", "data"):
+                if key in data and isinstance(data[key], list):
+                    return {"emails": data[key]}
+        return data
 
 
 parse_agent = build_structured_agent(ParsedEmailBatch)
 
-structured_llm = _get_llm().with_structured_output(ParsedEmailBatch)
+structured_llm = _get_llm().with_structured_output(ParsedEmailBatch, method="json_mode")
 
 
 def chunk_list(rows, batch_size):
@@ -621,7 +701,7 @@ EMAIL BODY:
 - ОБЯЗАТЕЛЬНО укажи email_id
 - не смешивай письма между собой
 
-Верни результат в формате ParsedEmailBatch.
+Верни результат в формате JSON (ParsedEmailBatch schema).
 
 {chr(10).join(parts)}
 """
@@ -647,7 +727,7 @@ def process_parse_batch(batch_rows):
         parsed_rows = []
         returned_ids = set()
 
-        for item in structured.items:
+        for item in structured.emails:
             returned_ids.add(item.email_id)
             parsed_rows.append({
                 "email_id": item.email_id,
@@ -831,25 +911,23 @@ def build_message_docs(df: pd.DataFrame) -> list[Document]:
         if not parsed:
             continue
 
-        parsed_emails = parsed.get("emails", [])
-        if not isinstance(parsed_emails, list):
+        entries = parsed.get("thread", [])
+        if not isinstance(entries, list):
             continue
 
         subj = (row.get("subject") or "").strip()
         participants = participants_list(row)
 
-        for msg in parsed_emails:
+        for idx, msg in enumerate(entries, start=1):
             if not isinstance(msg, dict):
                 continue
 
-            email_body = (msg.get("email_body") or "").strip()
-            if not email_body:
+            body = (msg.get("body") or "").strip()
+            if not body:
                 continue
 
-            topic = (msg.get("topic") or subj or "").strip()
+            topic = (msg.get("subject") or subj or "").strip()
             msg_date = msg.get("date")
-            mail_query_number = msg.get("mail_query_number")
-            keywords = msg.get("key_words") or []
             thread_key = row.get("thread_key") or normalize_subject(subj)
 
             meta = {
@@ -857,17 +935,19 @@ def build_message_docs(df: pd.DataFrame) -> list[Document]:
                 "message_id": row.get("message_id"),
                 "subject": subj,
                 "topic": topic,
-                "date": str(msg_date) if msg_date is not None else str(row.get("sent_at_utc")),
-                "mail_query_number": int(mail_query_number) if str(mail_query_number).isdigit() else mail_query_number,
-                "keywords": keywords,
+                "date": str(msg_date) if msg_date else str(row.get("sent_at_utc")),
+                "mail_query_number": idx,
+                "keywords": [],
                 "sent_at_utc": str(row.get("sent_at_utc")),
                 "folder": row.get("folder"),
                 "participants": participants,
                 "thread_key": thread_key,
                 "source_type": "message",
+                "from": msg.get("from"),
+                "to": msg.get("to"),
             }
 
-            docs.append(Document(page_content=email_body, metadata=meta))
+            docs.append(Document(page_content=body, metadata=meta))
 
     return docs
 

@@ -34,6 +34,10 @@ app.add_middleware(
 SQL_DIR = Path(__file__).parent / "sql"
 
 
+class ImportRequest(BaseModel):
+    max_emails: int = 0
+
+
 class CleanBodiesRequest(BaseModel):
     fetch_batch: int = 30
     llm_batch: int = 5
@@ -64,6 +68,7 @@ class CorpusBatchRequest(BaseModel):
 
 class AnalysisRequest(BaseModel):
     project_hint: str
+    max_batches: int = 0
 
 
 def _run_sql_file(client, path: Path):
@@ -96,8 +101,8 @@ def api_init_db():
 
 
 @app.post("/pipeline/import-mbox")
-def api_import_mbox():
-    import_mbox_to_clickhouse()
+def api_import_mbox(payload: ImportRequest):
+    import_mbox_to_clickhouse(max_emails=payload.max_emails)
     return {"status": "ok"}
 
 
@@ -157,7 +162,7 @@ def api_corpus_batch(payload: CorpusBatchRequest):
 
 @app.post("/analysis/batch")
 def api_batch_analysis(payload: AnalysisRequest):
-    result = run_batch_analysis(payload.project_hint)
+    result = run_batch_analysis(payload.project_hint, max_batches=payload.max_batches)
     return {"status": "ok", "result": result}
 
 
